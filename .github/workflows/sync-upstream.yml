@@ -1,0 +1,45 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9am UTC
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/${{ vars.UPSTREAM_REPO }}.git
+          git fetch upstream
+
+      - name: Update upstream branch
+        run: |
+          git checkout -B upstream upstream/main
+          git push origin upstream --force
+
+      - name: Create PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing=$(gh pr list --head upstream --base main --json number -q '.[0].number')
+          if [ -z "$existing" ]; then
+            gh pr create \
+              --title "⬆️ Sync upstream changes ($(date +%Y-%m-%d))" \
+              --body "Weekly sync from upstream repository." \
+              --head upstream \
+              --base main
+          else
+            echo "PR #$existing already exists"
+          fi
