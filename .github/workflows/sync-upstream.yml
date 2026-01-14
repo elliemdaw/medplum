@@ -59,8 +59,8 @@ jobs:
             gh pr create \
               --title "⬆️ Sync upstream changes ($(date +%Y-%m-%d))" \
               --body "Weekly sync from upstream repository." \
-              --head tracks-upstream \
-              --base main
+              --head elliemdaw:tracks-upstream \
+              --base elliemdaw:main
           else
             echo "PR #$existing already exists"
           fi
