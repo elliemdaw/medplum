@@ -16,10 +16,9 @@ import { randomUUID } from 'node:crypto';
 import { getConfig } from './config/loader';
 import { getRepoForLogin } from './fhir/accesspolicy';
 import { FhirRateLimiter } from './fhir/fhirquota';
-import type { Repository } from './fhir/repo';
-import { getSystemRepo } from './fhir/repo';
+import type { Repository, SystemRepository } from './fhir/repo';
 import { ResourceCap } from './fhir/resource-cap';
-import { globalLogger, systemLogger } from './logger';
+import { globalLogger } from './logger';
 import type { AuthState } from './oauth/middleware';
 import { authenticateTokenImpl, isExtendedMode } from './oauth/middleware';
 import { getRedis } from './redis';
@@ -108,18 +107,16 @@ export class AuthenticatedRequestContext extends RequestContext {
     return this.authState;
   }
 
-  [Symbol.dispose](): void {
-    this.repo[Symbol.dispose]();
+  /**
+   * @returns a SystemRepository for the same shard as this context's repository.
+   * Use this when you need elevated privileges within request handling.
+   */
+  get systemRepo(): SystemRepository {
+    return this.repo.getSystemRepo();
   }
 
-  static system(ctx?: { requestId?: string; traceId?: string }): AuthenticatedRequestContext {
-    return new AuthenticatedRequestContext(
-      ctx?.requestId ?? '',
-      ctx?.traceId ?? '',
-      { userConfig: {} } as unknown as AuthState,
-      getSystemRepo(),
-      { logger: systemLogger }
-    );
+  [Symbol.dispose](): void {
+    this.repo[Symbol.dispose]();
   }
 }
 
@@ -221,7 +218,7 @@ export function extractAmazonTraceId(amznTraceId: string): string | undefined {
   return match ? match[1] : undefined;
 }
 
-export function buildTracingExtension(): Extension[] | undefined {
+export function buildTracingExtension(): Extension | undefined {
   const ctx = tryGetRequestContext();
 
   if (ctx === undefined) {
@@ -241,12 +238,10 @@ export function buildTracingExtension(): Extension[] | undefined {
     return undefined;
   }
 
-  return [
-    {
-      url: 'https://medplum.com/fhir/StructureDefinition/tracing',
-      extension: subExtensions,
-    },
-  ];
+  return {
+    url: 'https://medplum.com/fhir/StructureDefinition/tracing',
+    extension: subExtensions,
+  };
 }
 
 function requestIds(req: Request): { requestId: string; traceId: string } {

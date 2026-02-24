@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Hl7Message, OperationOutcomeError, sleep, validationError } from '@medplum/core';
+import { Hl7Message, OperationOutcomeError, ReturnAckCategory, sleep, validationError } from '@medplum/core';
 import iconv from 'iconv-lite';
 import type net from 'node:net';
 import { Hl7Base } from './base';
 import { CR, FS, VT } from './constants';
-import { Hl7CloseEvent, Hl7ErrorEvent, Hl7MessageEvent } from './events';
+import { Hl7CloseEvent, Hl7EnhancedAckSentEvent, Hl7ErrorEvent, Hl7MessageEvent } from './events';
+
+// Export `ReturnAckCategory` for backwards-compat
+export { ReturnAckCategory } from '@medplum/core';
 
 // iconv-lite docs have great examples and explanations for how to use Buffers with iconv-lite:
 // See: https://github.com/ashtuchkin/iconv-lite/wiki/Use-Buffers-when-decoding
@@ -18,16 +21,8 @@ export type Hl7MessageQueueItem = {
   timer?: NodeJS.Timeout;
 };
 
-export const ReturnAckCategory = {
-  /** The first ACK message received is the one returned */
-  FIRST: 'first',
-  /** Only return upon receiving a positive application-level ACK (AA), or if a commit-level error occurred */
-  APPLICATION: 'application',
-} as const;
-export type ReturnAckCategory = (typeof ReturnAckCategory)[keyof typeof ReturnAckCategory];
-
 export interface SendAndWaitOptions {
-  /** The ACK-level that the Promise should resolve on. The default is `ReturnAckCategory.ANY` (returns on the first ACK of any type). */
+  /** The ACK-level that the Promise should resolve on. The default is `ReturnAckCategory.APPLICATION` (returns on the first application-level ACK). */
   returnAck?: ReturnAckCategory;
   /** The amount of milliseconds to wait before timing out when waiting for the response to a message. */
   timeoutMs?: number;
@@ -37,13 +32,21 @@ export interface Hl7ConnectionOptions {
   messagesPerMin?: number;
 }
 
+/**
+ * Enhanced mode for HL7 connections.
+ * - `'standard'`: Standard enhanced mode behavior
+ * - `'aaMode'`: AA mode - special enhanced mode that only accepts AA acknowledgements
+ * - `undefined`: Enhanced mode is not enabled (standard behavior)
+ */
+export type EnhancedMode = 'standard' | 'aaMode' | undefined;
+
 export const DEFAULT_ENCODING = 'utf-8';
 const ONE_MINUTE = 60 * 1000;
 
 export class Hl7Connection extends Hl7Base {
   readonly socket: net.Socket;
   encoding: string;
-  enhancedMode: boolean;
+  enhancedMode: EnhancedMode = undefined;
   private messagesPerMin: number | undefined = undefined;
   private chunks: Buffer[] = [];
   private readonly pendingMessages: Map<string, Hl7MessageQueueItem> = new Map<string, Hl7MessageQueueItem>();
@@ -54,7 +57,7 @@ export class Hl7Connection extends Hl7Base {
   constructor(
     socket: net.Socket,
     encoding: string = DEFAULT_ENCODING,
-    enhancedMode = false,
+    enhancedMode?: EnhancedMode,
     options: Hl7ConnectionOptions = {}
   ) {
     super();
@@ -92,8 +95,17 @@ export class Hl7Connection extends Hl7Base {
     });
 
     this.addEventListener('message', (event) => {
-      if (this.enhancedMode) {
-        this.send(event.message.buildAck({ ackCode: 'CA' }));
+      // In standard enhanced mode, send commit ACK (CA) immediately, then later forward app-level ACKs
+      // In aaMode, send application ACK (AA) immediately, then ignore any later app-level ACKs
+      let response: Hl7Message | undefined;
+      if (this.enhancedMode === 'standard') {
+        response = event.message.buildAck({ ackCode: 'CA' });
+      } else if (this.enhancedMode === 'aaMode') {
+        response = event.message.buildAck({ ackCode: 'AA' });
+      }
+      if (response) {
+        this.send(response);
+        this.dispatchEvent(new Hl7EnhancedAckSentEvent(this, response));
       }
       const origMsgCtrlId = event.message.getSegment('MSA')?.getField(2)?.toString();
       // If there is no message control ID, just return
@@ -167,7 +179,7 @@ export class Hl7Connection extends Hl7Base {
     this.responseQueueProcessing = true;
     while (this.responseQueue.length) {
       if (this.messagesPerMin) {
-        const millisBetweenMsgs = ONE_MINUTE / (this.messagesPerMin as number);
+        const millisBetweenMsgs = ONE_MINUTE / this.messagesPerMin;
         const elapsedMillis = Date.now() - this.lastMessageDispatchedTime;
         if (millisBetweenMsgs > elapsedMillis) {
           await sleep(millisBetweenMsgs - elapsedMillis);
@@ -357,11 +369,11 @@ export class Hl7Connection extends Hl7Base {
     return this.encoding;
   }
 
-  setEnhancedMode(enhancedMode: boolean): void {
+  setEnhancedMode(enhancedMode: EnhancedMode): void {
     this.enhancedMode = enhancedMode;
   }
 
-  getEnhancedMode(): boolean {
+  getEnhancedMode(): EnhancedMode {
     return this.enhancedMode;
   }
 

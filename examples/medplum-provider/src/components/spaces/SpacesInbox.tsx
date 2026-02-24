@@ -1,31 +1,28 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Stack, Text, Box, ScrollArea, Group, ActionIcon, CloseButton, Avatar, ThemeIcon } from '@mantine/core';
+import { Stack, Text, Box, ScrollArea, Group, ActionIcon, CloseButton, Avatar, ThemeIcon, Button } from '@mantine/core';
 import type { JSX } from 'react';
 import { useState, useRef, useEffect } from 'react';
 import { useMedplum, useResource } from '@medplum/react';
-import { IconRobot, IconLayoutSidebarLeftCollapse, IconLayoutSidebarLeftExpand, IconPlus } from '@tabler/icons-react';
+import {
+  IconRobot,
+  IconLayoutSidebarLeftCollapse,
+  IconLayoutSidebarLeftExpand,
+  IconPlus,
+  IconCode,
+} from '@tabler/icons-react';
 import { showErrorNotification } from '../../utils/notifications';
 import { ResourceBox } from './ResourceBox';
 import { ResourcePanel } from './ResourcePanel';
+import { ComponentPreview } from './ComponentPreview';
 import type { Message } from '../../types/spaces';
-import { createConversationTopic, saveMessage, loadConversationMessages } from '../../utils/spacePersistence';
+import { loadConversationMessages } from '../../utils/spacePersistence';
+import { processMessage } from '../../utils/spaceMessaging';
 import { HistoryList } from './HistoryList';
 import { ChatInput } from '../../pages/spaces/ChatInput';
-import type { Identifier, Communication, Reference } from '@medplum/fhirtypes';
-import { getReferenceString } from '@medplum/core';
+import type { Communication, Reference } from '@medplum/fhirtypes';
 import classes from './SpacesInbox.module.css';
 import cx from 'clsx';
-
-const fhirRequestToolsId: Identifier = {
-  value: 'ai-fhir-request-tools',
-  system: 'https://www.medplum.com/bots',
-};
-
-const resourceSummaryBotId: Identifier = {
-  value: 'ai-resource-summary',
-  system: 'https://www.medplum.com/bots',
-};
 
 interface SpaceInboxProps {
   topic: Communication | Reference<Communication> | undefined;
@@ -41,40 +38,56 @@ export function SpacesInbox(props: SpaceInboxProps): JSX.Element {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gpt-5');
+  const [selectedModel, setSelectedModel] = useState('gpt-4o-mini');
   const [hasStarted, setHasStarted] = useState(false);
   const [currentFhirRequest, setCurrentFhirRequest] = useState<string | undefined>();
   const [currentTopicId, setCurrentTopicId] = useState<string | undefined>(topic?.id);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedResource, setSelectedResource] = useState<string | undefined>();
+  const [streamingContent, setStreamingContent] = useState<string | undefined>();
+  const [componentPreview, setComponentPreview] = useState<{ code: string } | undefined>();
   const scrollViewportRef = useRef<HTMLDivElement>(null);
+  const isSendingRef = useRef(false);
+  const loadVersionRef = useRef(0);
 
   // Load conversation when topic changes
   useEffect(() => {
     const topicId = topic?.id;
     if (topicId) {
+      if (isSendingRef.current) {
+        return;
+      }
+      loadVersionRef.current++;
+      const myVersion = loadVersionRef.current;
       const loadTopic = async (): Promise<void> => {
         try {
           setLoading(true);
           const loadedMessages = await loadConversationMessages(medplum, topicId);
+          // Check if this load is stale (a newer load or send has started)
+          if (myVersion !== loadVersionRef.current) {
+            return;
+          }
           setMessages([...loadedMessages]);
           setCurrentTopicId(topicId);
           setHasStarted(true);
           setSelectedResource(undefined);
+          setComponentPreview(undefined);
         } catch (error) {
           showErrorNotification(error);
         } finally {
-          setLoading(false);
+          if (myVersion === loadVersionRef.current) {
+            setLoading(false);
+          }
         }
       };
       loadTopic().catch(showErrorNotification);
     } else {
-      // Reset state when no topic is selected
       setMessages([]);
       setHasStarted(false);
       setCurrentTopicId(undefined);
       setSelectedResource(undefined);
+      setComponentPreview(undefined);
     }
   }, [topic, medplum]);
 
@@ -86,20 +99,43 @@ export function SpacesInbox(props: SpaceInboxProps): JSX.Element {
         behavior: 'smooth',
       });
     }
-  }, [messages, hasStarted]);
+  }, [messages, hasStarted, streamingContent]);
+
+  // Scroll again after loading finishes to show resources
+  useEffect(() => {
+    const viewport = scrollViewportRef.current;
+    if (viewport && hasStarted && !loading) {
+      const timer = setTimeout(() => {
+        viewport.scrollTo({
+          top: viewport.scrollHeight,
+          behavior: 'smooth',
+        });
+      }, 300);
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [loading, hasStarted]);
 
   const handleSelectTopic = async (selectedTopicId: string): Promise<void> => {
+    loadVersionRef.current++;
+    const myVersion = loadVersionRef.current;
     try {
       setLoading(true);
       const loadedMessages = await loadConversationMessages(medplum, selectedTopicId);
+      if (myVersion !== loadVersionRef.current) {
+        return;
+      }
       setMessages([...loadedMessages]);
       setCurrentTopicId(selectedTopicId);
       setHasStarted(true);
       setSelectedResource(undefined);
+      setComponentPreview(undefined);
     } catch (error) {
       showErrorNotification(error);
     } finally {
-      setLoading(false);
+      if (myVersion === loadVersionRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -118,146 +154,37 @@ export function SpacesInbox(props: SpaceInboxProps): JSX.Element {
     setMessages(currentMessages);
     setInput('');
     setCurrentFhirRequest(undefined);
+    setStreamingContent(undefined);
     setLoading(true);
+    isSendingRef.current = true;
+    loadVersionRef.current++;
 
     try {
-      // Create topic on first message
-      let activeTopicId = currentTopicId;
-      if (isFirstMessage) {
-        const topic = await createConversationTopic(medplum, input.substring(0, 100), selectedModel);
-        activeTopicId = topic.id;
-        setCurrentTopicId(activeTopicId);
-        setRefreshKey((prev) => prev + 1); // Refresh list to show new topic
-        // Notify parent to navigate to the new topic
-        onNewTopic(topic);
-      }
-
-      // Save user message
-      if (activeTopicId) {
-        await saveMessage(medplum, activeTopicId, userMessage, currentMessages.length - 1);
-      }
-      let response = await medplum.executeBot(fhirRequestToolsId, {
-        resourceType: 'Parameters',
-        parameter: [
-          { name: 'messages', valueString: JSON.stringify(currentMessages) },
-          { name: 'model', valueString: selectedModel },
-        ],
+      const result = await processMessage({
+        medplum,
+        input,
+        userMessage,
+        currentMessages,
+        currentTopicId,
+        selectedModel,
+        isFirstMessage,
+        setCurrentTopicId,
+        setRefreshKey,
+        setCurrentFhirRequest,
+        onNewTopic,
+        onStreamChunk: (chunk) => {
+          setStreamingContent((prev) => (prev ?? '') + chunk);
+          setCurrentFhirRequest(undefined);
+        },
       });
-
-      const toolCallsStr = response.parameter?.find((p: any) => p.name === 'tool_calls')?.valueString;
-      const allResourceRefs: string[] = [];
-
-      if (toolCallsStr) {
-        const toolCalls = JSON.parse(toolCallsStr);
-        const assistantMessageWithToolCalls: Message = {
-          role: 'assistant',
-          content: null,
-          tool_calls: toolCalls,
-        };
-        currentMessages.push(assistantMessageWithToolCalls);
-
-        // Save tool call message
-        if (activeTopicId) {
-          await saveMessage(medplum, activeTopicId, assistantMessageWithToolCalls, currentMessages.length - 1);
-        }
-
-        for (const toolCall of toolCalls) {
-          if (toolCall.function.name === 'fhir_request') {
-            const args =
-              typeof toolCall.function.arguments === 'string'
-                ? JSON.parse(toolCall.function.arguments)
-                : toolCall.function.arguments;
-
-            const { method, path, body } = args;
-            setCurrentFhirRequest(`${method} ${path}`);
-            let result;
-            try {
-              if (method === 'GET') {
-                result = await medplum.get(medplum.fhirUrl(path));
-              } else if (method === 'POST') {
-                result = await medplum.post(medplum.fhirUrl(path), body);
-              } else if (method === 'PUT') {
-                result = await medplum.put(medplum.fhirUrl(path), body);
-              } else if (method === 'DELETE') {
-                result = await medplum.delete(medplum.fhirUrl(path));
-              }
-
-              if (result?.resourceType === 'Bundle' && result?.entry) {
-                result.entry.forEach((entry: any) => {
-                  if (entry.resource) {
-                    const ref = getReferenceString(entry.resource);
-                    if (ref) {
-                      allResourceRefs.push(ref);
-                    }
-                  }
-                });
-              } else if (result) {
-                const ref = getReferenceString(result);
-                if (ref) {
-                  allResourceRefs.push(ref);
-                }
-              }
-
-              const toolMessage: Message = {
-                role: 'tool',
-                tool_call_id: toolCall.id,
-                content: JSON.stringify(result),
-              };
-              currentMessages.push(toolMessage);
-
-              // Save tool response message
-              if (activeTopicId) {
-                await saveMessage(medplum, activeTopicId, toolMessage, currentMessages.length - 1);
-              }
-            } catch (err: any) {
-              const errorResult = {
-                error: true,
-                message: `Unable to execute ${method}: ${path}`,
-                details: err.message || 'Unknown error',
-              };
-
-              const toolErrorMessage: Message = {
-                role: 'tool',
-                tool_call_id: toolCall.id,
-                content: JSON.stringify(errorResult),
-              };
-              currentMessages.push(toolErrorMessage);
-
-              // Save tool error message
-              if (activeTopicId) {
-                await saveMessage(medplum, activeTopicId, toolErrorMessage, currentMessages.length - 1);
-              }
-            }
-          }
-        }
-
-        response = await medplum.executeBot(resourceSummaryBotId, {
-          resourceType: 'Parameters',
-          parameter: [
-            { name: 'messages', valueString: JSON.stringify(currentMessages) },
-            { name: 'model', valueString: selectedModel },
-          ],
-        });
-      }
-
-      const content = response.parameter?.find((p: any) => p.name === 'content')?.valueString;
-      if (content) {
-        const uniqueRefs = allResourceRefs.length > 0 ? [...new Set(allResourceRefs)] : undefined;
-        const assistantMessage: Message = {
-          role: 'assistant',
-          content,
-          resources: uniqueRefs,
-        };
-        setMessages([...currentMessages, assistantMessage]);
-
-        // Save assistant message
-        if (activeTopicId) {
-          await saveMessage(medplum, activeTopicId, assistantMessage, currentMessages.length);
-        }
-      }
-    } catch (error: any) {
-      setMessages([...currentMessages, { role: 'assistant', content: `Error: ${error.message}` }]);
+      setStreamingContent(undefined);
+      setMessages(result.updatedMessages);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      setMessages([...currentMessages, { role: 'assistant', content: `Error: ${errorMessage}` }]);
     } finally {
+      isSendingRef.current = false;
+      setStreamingContent(undefined);
       setLoading(false);
     }
   };
@@ -267,6 +194,11 @@ export function SpacesInbox(props: SpaceInboxProps): JSX.Element {
       e.preventDefault();
       handleSend().catch((error) => showErrorNotification(error));
     }
+  };
+
+  const handleViewComponent = (code: string): void => {
+    setSelectedResource(undefined);
+    setComponentPreview({ code });
   };
 
   const visibleMessages = messages.filter(
@@ -348,24 +280,55 @@ export function SpacesInbox(props: SpaceInboxProps): JSX.Element {
                       <Text style={{ whiteSpace: 'pre-wrap' }}>{message.content}</Text>
                     </div>
                     {message.resources && message.resources.length > 0 && (
-                      <Stack gap="xs" mt="sm" ml={message.role === 'assistant' ? 0 : 'auto'}>
+                      <Stack gap="xs" mt="sm" w={300} ml={message.role === 'assistant' ? 0 : 'auto'}>
                         {message.resources.map((resourceRef, idx) => (
-                          <ResourceBox key={idx} resourceReference={resourceRef} onClick={setSelectedResource} />
+                          <ResourceBox
+                            key={idx}
+                            resourceReference={resourceRef}
+                            onClick={(ref) => {
+                              setComponentPreview(undefined);
+                              setSelectedResource(ref);
+                            }}
+                          />
                         ))}
                       </Stack>
+                    )}
+                    {message.componentCode && (
+                      <Button
+                        variant="light"
+                        size="xs"
+                        leftSection={<IconCode size={14} />}
+                        mt="sm"
+                        onClick={() => {
+                          if (message.componentCode) {
+                            handleViewComponent(message.componentCode);
+                          }
+                        }}
+                      >
+                        View Component
+                      </Button>
                     )}
                   </div>
                 ))}
                 {loading && (
                   <div className={cx(classes.messageWrapper, classes.assistantMessage)}>
-                    <Group align="center" gap="sm">
+                    <Group align="flex-start" gap="sm" mb={4}>
                       <Avatar radius="xl" size="sm" color="blue">
                         <IconRobot size={14} />
                       </Avatar>
-                      <Text size="sm" c="dimmed" fs="italic">
-                        {currentFhirRequest ? `Executing ${currentFhirRequest}...` : 'Thinking...'}
+                      <Text fw={600} size="sm" c="dimmed">
+                        AI Assistant
                       </Text>
                     </Group>
+                    <div className={classes.messageContent}>
+                      {streamingContent ? (
+                        <Text style={{ whiteSpace: 'pre-wrap' }}>{streamingContent}</Text>
+                      ) : (
+                        <Text size="sm" c="dimmed" fs="italic">
+                          {currentFhirRequest ? `Executing ${currentFhirRequest}...` : 'Thinking...'}
+                        </Text>
+                      )}
+                    </div>
                   </div>
                 )}
               </Stack>
@@ -400,6 +363,21 @@ export function SpacesInbox(props: SpaceInboxProps): JSX.Element {
           </div>
           <ScrollArea style={{ flex: 1 }} p="md">
             <ResourcePanel key={selectedResource} resource={{ reference: selectedResource }} />
+          </ScrollArea>
+        </div>
+      )}
+
+      {/* Component Preview Panel */}
+      {componentPreview && (
+        <div className={classes.resourcePanel}>
+          <div className={classes.resourceHeader}>
+            <Text fw={600} size="sm">
+              Component Preview
+            </Text>
+            <CloseButton onClick={() => setComponentPreview(undefined)} />
+          </div>
+          <ScrollArea style={{ flex: 1 }} p="md">
+            <ComponentPreview code={componentPreview.code} />
           </ScrollArea>
         </div>
       )}

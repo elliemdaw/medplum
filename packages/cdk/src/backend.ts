@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { MedplumInfraConfig } from '@medplum/core';
+import { EMPTY } from '@medplum/core';
 import {
   Duration,
   RemovalPolicy,
@@ -101,7 +102,7 @@ export class BackEnd extends Construct {
 
     // RDS
     this.rdsSecretsArn = config.rdsSecretsArn;
-    if (!this.rdsSecretsArn) {
+    if (!this.rdsSecretsArn || config.rdsForceRetain) {
       const { engine, majorVersion } = getPostgresEngine(
         config.rdsInstanceVersion,
         rds.AuroraPostgresEngineVersion.VER_16_9
@@ -232,7 +233,9 @@ export class BackEnd extends Construct {
       assert(secret instanceof Secret, 'rdsCluster.secretAttachment.node.scope is not a Secret');
       secret.applyRemovalPolicy(RemovalPolicy.RETAIN);
 
-      this.rdsSecretsArn = secretAttachment.secretArn;
+      if (!this.rdsSecretsArn) {
+        this.rdsSecretsArn = secretAttachment.secretArn;
+      }
 
       if (config.rdsProxyEnabled) {
         this.rdsProxy = new rds.DatabaseProxy(this, 'DatabaseProxy', {
@@ -502,17 +505,15 @@ export class BackEnd extends Construct {
       hostPort: config.apiPort,
     });
 
-    if (config.additionalContainers) {
-      for (const container of config.additionalContainers) {
-        this.taskDefinition.addContainer('AdditionalContainer-' + container.name, {
-          containerName: container.name,
-          image: this.getContainerImage(config, container.image, containerRegistryCredentials),
-          command: container.command,
-          environment: container.environment,
-          logging: this.logDriver,
-          essential: container.essential ?? false, // Default to false
-        });
-      }
+    for (const container of config.additionalContainers ?? EMPTY) {
+      this.taskDefinition.addContainer('AdditionalContainer-' + container.name, {
+        containerName: container.name,
+        image: this.getContainerImage(config, container.image, containerRegistryCredentials),
+        command: container.command,
+        environment: container.environment,
+        logging: this.logDriver,
+        essential: container.essential ?? false, // Default to false
+      });
     }
 
     if (config.fireLens?.enabled) {
@@ -696,7 +697,7 @@ export class BackEnd extends Construct {
         tier: ssm.ParameterTier.STANDARD,
         parameterName: `/medplum/${name}/databaseProxyEndpoint`,
         description: 'Database proxy endpoint',
-        stringValue: this.rdsProxy?.endpoint as string,
+        stringValue: this.rdsProxy?.endpoint,
       });
     }
 

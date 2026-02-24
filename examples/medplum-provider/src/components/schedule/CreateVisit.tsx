@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { CodingInput, DateTimeInput, Form, ResourceInput, useMedplum } from '@medplum/react';
-import { useState, useEffect } from 'react';
+import { useState, useMemo } from 'react';
 import type { JSX } from 'react';
-import type { SlotInfo } from 'react-big-calendar';
 import { Button, Card, Flex, Stack, Text, Title } from '@mantine/core';
 import type { Coding, Patient, PlanDefinition, PlanDefinitionAction } from '@medplum/fhirtypes';
 import { IconAlertSquareRounded, IconCircleCheck, IconCirclePlus } from '@tabler/icons-react';
@@ -12,15 +11,14 @@ import { createEncounter } from '../../utils/encounter';
 import { showErrorNotification } from '../../utils/notifications';
 import { useNavigate } from 'react-router';
 import { showNotification } from '@mantine/notifications';
+import type { Range } from '../../types/scheduling';
 
 interface CreateVisitProps {
-  appointmentSlot: SlotInfo | undefined;
+  appointmentSlot: Range | undefined;
 }
 
 export function CreateVisit(props: CreateVisitProps): JSX.Element {
   const { appointmentSlot } = props;
-  const [formattedDate, setFormattedDate] = useState<string>('');
-  const [formattedSlotTime, setFormattedSlotTime] = useState<string>('');
   const [patient, setPatient] = useState<Patient | undefined>();
   const [planDefinitionData, setPlanDefinitionData] = useState<PlanDefinition | undefined>();
   const [encounterClass, setEncounterClass] = useState<Coding | undefined>();
@@ -30,9 +28,9 @@ export function CreateVisit(props: CreateVisitProps): JSX.Element {
   const medplum = useMedplum();
   const navigate = useNavigate();
 
-  useEffect(() => {
+  const [formattedDate, formattedSlotTime] = useMemo(() => {
     if (!appointmentSlot) {
-      return;
+      return ['', ''];
     }
 
     const startDate = new Date(appointmentSlot?.start);
@@ -51,8 +49,7 @@ export function CreateVisit(props: CreateVisitProps): JSX.Element {
     const endTimeStr = endDate.toLocaleTimeString('en-US', timeOptions);
 
     const formattedTime = `${startTimeStr} – ${endTimeStr}`;
-    setFormattedDate(dateStr);
-    setFormattedSlotTime(formattedTime);
+    return [dateStr, formattedTime];
   }, [appointmentSlot]);
 
   async function handleSubmit(): Promise<void> {

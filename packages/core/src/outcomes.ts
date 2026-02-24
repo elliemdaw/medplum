@@ -450,10 +450,8 @@ export class OperationOutcomeError extends Error {
 
   constructor(outcome: OperationOutcome, options?: ErrorOptions) {
     super(operationOutcomeToString(outcome), options);
-    Object.setPrototypeOf(this, OperationOutcomeError.prototype);
-    this.name = this.constructor.name;
+    this.name = 'OperationOutcomeError';
     this.outcome = outcome;
-    Error.captureStackTrace(this, this.constructor);
   }
 }
 
@@ -497,7 +495,7 @@ export function normalizeErrorString(error: unknown): string {
 }
 
 /**
- * Returns a string represenation of the operation outcome.
+ * Returns a string representation of the operation outcome.
  * @param outcome - The operation outcome.
  * @returns The string representation of the operation outcome.
  */
@@ -507,7 +505,7 @@ export function operationOutcomeToString(outcome: OperationOutcome): string {
 }
 
 /**
- * Returns a string represenation of the operation outcome issue.
+ * Returns a string representation of the operation outcome issue.
  * @param issue - The operation outcome issue.
  * @returns The string representation of the operation outcome issue.
  */

@@ -6,6 +6,7 @@ import {
   Code,
   Divider,
   Grid,
+  Group,
   InputWrapper,
   Modal,
   NativeSelect,
@@ -88,7 +89,7 @@ export function SuperAdminPage(): JSX.Element {
 
   function getDatabaseStats(formData: Record<string, string>): void {
     medplum
-      .post(
+      .post<Parameters>(
         'fhir/R4/$db-stats',
         formData.tableNames
           ? {
@@ -97,7 +98,7 @@ export function SuperAdminPage(): JSX.Element {
             }
           : undefined
       )
-      .then((params: Parameters) => {
+      .then((params) => {
         setModalTitle('Database Stats');
         setModalContent(<pre>{params.parameter?.find((p) => p.name === 'tableString')?.valueString}</pre>);
         open();
@@ -107,8 +108,8 @@ export function SuperAdminPage(): JSX.Element {
 
   function getDatabaseInvalidIndexes(): void {
     medplum
-      .post('fhir/R4/$db-invalid-indexes')
-      .then((params: Parameters) => {
+      .post<Parameters>('fhir/R4/$db-invalid-indexes')
+      .then((params) => {
         setModalTitle('Database Invalid Indexes');
         setModalContent(
           <pre>
@@ -125,8 +126,8 @@ export function SuperAdminPage(): JSX.Element {
 
   function getSchemaDiff(): void {
     medplum
-      .post('fhir/R4/$db-schema-diff')
-      .then((params: Parameters) => {
+      .post<Parameters>('fhir/R4/$db-schema-diff')
+      .then((params) => {
         setModalTitle('Schema Diff');
         setModalContent(<pre>{params.parameter?.find((p) => p.name === 'migrationString')?.valueString}</pre>);
         open();
@@ -176,20 +177,7 @@ export function SuperAdminPage(): JSX.Element {
         When Medplum changes how resources are indexed, the system may require a reindex for old resources to be indexed
         properly.
       </p>
-      <Form onSubmit={reindexResourceType}>
-        <Stack>
-          <FormSection title="Resource Type" htmlFor="resourceType">
-            <TextInput id="resourceType" name="resourceType" placeholder="Reindex Resource Type" />
-          </FormSection>
-          <FormSection title="Search Filter" htmlFor="filter">
-            <TextInput id="filter" name="filter" placeholder="e.g. name=Sam&birthdate=lt2000-01-01" />
-          </FormSection>
-          <FormSection title="Max Resource Version" htmlFor="maxResourceVersion">
-            <MaxResourceVersionInput />
-          </FormSection>
-          <Button type="submit">Reindex</Button>
-        </Stack>
-      </Form>
+      <ReindexForm onSubmit={reindexResourceType} />
       <Divider my="lg" />
       <Title order={2}>Purge Resources</Title>
       <p>As system generated resources accumulate, the system may require a purge to remove old resources.</p>
@@ -309,6 +297,115 @@ function MaxResourceVersionInput(): JSX.Element {
   );
 }
 
+function ReindexForm({ onSubmit }: { readonly onSubmit: (formData: Record<string, string>) => void }): JSX.Element {
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  function handleSubmit(formData: Record<string, string>): void {
+    const cleanedData: Record<string, string> = {};
+    for (const [key, value] of Object.entries(formData)) {
+      if (value !== '') {
+        cleanedData[key] = value;
+      }
+    }
+    onSubmit(cleanedData);
+  }
+
+  return (
+    <Form onSubmit={handleSubmit}>
+      <Stack>
+        <FormSection title="Resource Type" htmlFor="resourceType">
+          <TextInput id="resourceType" name="resourceType" placeholder="Reindex Resource Type" />
+        </FormSection>
+        <FormSection title="Search Filter" htmlFor="filter">
+          <TextInput id="filter" name="filter" placeholder="e.g. name=Sam&birthdate=lt2000-01-01" />
+        </FormSection>
+        <FormSection title="Max Resource Version" htmlFor="maxResourceVersion">
+          <MaxResourceVersionInput />
+        </FormSection>
+
+        <Button variant="subtle" size="xs" onClick={() => setShowAdvanced(!showAdvanced)}>
+          {showAdvanced ? 'Hide Advanced Options' : 'Show Advanced Options'}
+        </Button>
+
+        {showAdvanced && (
+          <Stack gap="sm">
+            <Grid>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="batchSize"
+                  label="Resources per batch"
+                  description={<span>default: 500</span>}
+                  placeholder="500"
+                  min={20}
+                  max={1000}
+                />
+              </Grid.Col>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="searchStatementTimeout"
+                  label="Search query timeout (ms)"
+                  description={<span>default: 3,600,000 (1 hour)</span>}
+                  placeholder="3600000"
+                  min={1000}
+                />
+              </Grid.Col>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="upsertStatementTimeout"
+                  label="Upsert query timeout (ms)"
+                  description={<span>default: server `database.queryTimeout`</span>}
+                  placeholder="database.queryTimeout"
+                  min={1000}
+                />
+              </Grid.Col>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="delayBetweenBatches"
+                  label="Delay between batches (ms)"
+                  description={<span>default: 0</span>}
+                  placeholder="0"
+                  min={0}
+                  max={60000}
+                />
+              </Grid.Col>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="progressLogThreshold"
+                  label="Log progress every N resources"
+                  description={<span>default: 50,000</span>}
+                  placeholder="50000"
+                  min={1}
+                />
+              </Grid.Col>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="endTimestampBufferMinutes"
+                  label="End timestamp buffer (minutes)"
+                  description={<span>default: 5</span>}
+                  placeholder="5"
+                  min={1}
+                />
+              </Grid.Col>
+              <Grid.Col span={6}>
+                <NumberInput
+                  name="maxIterationAttempts"
+                  label="Max iteration attempts"
+                  description={<span>default: 3</span>}
+                  placeholder="3"
+                  min={1}
+                  max={20}
+                />
+              </Grid.Col>
+            </Grid>
+          </Stack>
+        )}
+
+        <Button type="submit">Reindex</Button>
+      </Stack>
+    </Form>
+  );
+}
+
 export function ExplainSearchForm({
   setModalTitle,
   setModalContent,
@@ -383,6 +480,7 @@ export function ExplainSearchForm({
     const toSubmit = {
       query: formData.query,
       analyze: formData.analyze === 'on',
+      count: formData.count === 'on',
       format: 'text',
     };
 
@@ -392,17 +490,31 @@ export function ExplainSearchForm({
     }
 
     medplum
-      .post('fhir/R4/$explain', toSubmit, undefined, { headers })
-      .then((params: Parameters) => {
+      .post<Parameters>('fhir/R4/$explain', toSubmit, undefined, { headers })
+      .then((params) => {
         setModalTitle('Database Explain');
         const explainLine = params.parameter?.find((p) => p.name === 'explain')?.valueString;
         const queryLine = params.parameter?.find((p) => p.name === 'query')?.valueString;
         const parametersLine = params.parameter?.find((p) => p.name === 'parameters')?.valueString;
+        const countEstimate = params.parameter?.find((p) => p.name === 'countEstimate')?.valueInteger?.toLocaleString();
+        const countAccurate = params.parameter?.find((p) => p.name === 'countAccurate')?.valueInteger?.toLocaleString();
         const lines = [queryLine, parametersLine, '\n', explainLine].join('\n');
         setModalContent(
-          <Code block maw={'100%'}>
-            {lines}
-          </Code>
+          <Stack>
+            <div>
+              <Text fw={700}>Query</Text>
+              <Code block maw={'100%'} style={{ whiteSpace: 'pre-wrap' }}>
+                {lines}
+              </Code>
+            </div>
+            {(countEstimate || countAccurate) && (
+              <div>
+                <Text fw={700}>Counts</Text>
+                {countEstimate && <Text>Estimate: {countEstimate}</Text>}
+                {countAccurate && <Text>Accurate: {countAccurate}</Text>}
+              </div>
+            )}
+          </Stack>
         );
         openModal();
       })
@@ -418,7 +530,10 @@ export function ExplainSearchForm({
     <Form onSubmit={explainSearch}>
       <Stack>
         <TextInput name="query" label="Search" required placeholder="Observation?code=85354-9&_sort=-date&_count=5" />
-        <Checkbox name="analyze" label="Analyze" />
+        <Group>
+          <Checkbox name="analyze" label="Analyze" />
+          <Checkbox name="count" label="Total count" />
+        </Group>
         <InputWrapper label="On Behalf Of">
           <Stack gap="sm">
             <ReferenceInput<Project>

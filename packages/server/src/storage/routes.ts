@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
+import { singularize } from '@medplum/core';
 import type { Binary } from '@medplum/fhirtypes';
 import type { Request, Response } from 'express';
 import { Router } from 'express';
@@ -8,7 +9,8 @@ import { createPrivateKey, createPublicKey, createVerify } from 'node:crypto';
 import { pipeline } from 'node:stream';
 import { promisify } from 'node:util';
 import { getConfig } from '../config/loader';
-import { getSystemRepo } from '../fhir/repo';
+import { getShardSystemRepo } from '../fhir/repo';
+import { TODO_SHARD_ID } from '../fhir/sharding';
 import { getBinaryStorage } from './loader';
 
 export const storageRouter = Router();
@@ -44,15 +46,15 @@ storageRouter.get('/:id{/:versionId}', async (req: Request, res: Response) => {
     return;
   }
 
-  const { id } = req.params;
-  const systemRepo = getSystemRepo();
+  const id = singularize(req.params.id) ?? '';
+  const systemRepo = getShardSystemRepo(TODO_SHARD_ID); // unauthenticated; how to know which shard to query for the Binary?
   const binary = await systemRepo.readResource<Binary>('Binary', id);
 
   try {
     const stream = await getBinaryStorage().readBinary(binary);
-    res.status(200).contentType(binary.contentType as string);
+    res.status(200).contentType(binary.contentType);
     await pump(stream, res);
-  } catch (_err) {
+  } catch {
     res.sendStatus(404);
   }
 });

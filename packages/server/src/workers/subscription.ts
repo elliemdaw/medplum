@@ -4,6 +4,7 @@ import type { BackgroundJobContext, BackgroundJobInteraction, WithId } from '@me
 import {
   AccessPolicyInteraction,
   ContentType,
+  EMPTY,
   Operator,
   createReference,
   deepClone,
@@ -13,7 +14,9 @@ import {
   isGone,
   isNotFound,
   isString,
+  matchesSearchRequest,
   normalizeOperationOutcome,
+  parseSearchRequest,
   resourceMatchesSubscriptionCriteria,
   satisfiedAccessPolicy,
   stringify,
@@ -39,14 +42,16 @@ import { executeBot } from '../bots/execute';
 import { getRequestContext, runInAsyncContext, tryGetRequestContext, tryRunInRequestContext } from '../context';
 import { buildAccessPolicy } from '../fhir/accesspolicy';
 import { isPreCommitSubscription } from '../fhir/precommit';
-import type { Repository, ResendSubscriptionsOptions } from '../fhir/repo';
-import { getSystemRepo } from '../fhir/repo';
+import type { ResendSubscriptionsOptions, SystemRepository } from '../fhir/repo';
+import { getGlobalSystemRepo, getProjectSystemRepo, getShardSystemRepo } from '../fhir/repo';
 import { RewriteMode, rewriteAttachments } from '../fhir/rewrite';
+import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { getLogger, globalLogger } from '../logger';
 import type { AuthState } from '../oauth/middleware';
 import { recordHistogramValue } from '../otel/otel';
-import { getRedis } from '../redis';
+import { getRedis, reconnectOnError } from '../redis';
 import type { SubEventsOptions } from '../subscriptions/websockets';
+import { getActiveSubsKey } from '../subscriptions/websockets';
 import { parseTraceparent } from '../traceparent';
 import { AuditEventOutcome, createSubscriptionAuditEvent } from '../util/auditevent';
 import type { WorkerInitializer } from './utils';
@@ -117,7 +122,7 @@ const jobName = 'SubscriptionJobData';
 
 export const initSubscriptionWorker: WorkerInitializer = (config) => {
   const defaultOptions: QueueBaseOptions = {
-    connection: config.redis,
+    connection: { ...config.redis, reconnectOnError },
   };
 
   const queue = new Queue<SubscriptionJobData>(queueName, {
@@ -146,7 +151,7 @@ export const initSubscriptionWorker: WorkerInitializer = (config) => {
   worker.on('active', (job) => {
     // Only record queuedDuration on the first attempt
     if (job.attemptsMade === 0) {
-      recordHistogramValue('medplum.subscription.queuedDuration', (Date.now() - (job.timestamp as number)) / 1000);
+      recordHistogramValue('medplum.subscription.queuedDuration', (Date.now() - job.timestamp) / 1000);
     }
   });
   worker.on('completed', (job) => {
@@ -154,10 +159,7 @@ export const initSubscriptionWorker: WorkerInitializer = (config) => {
       'medplum.subscription.executionDuration',
       ((job.finishedOn as number) - (job.processedOn as number)) / 1000
     );
-    recordHistogramValue(
-      'medplum.subscription.totalDuration',
-      ((job.finishedOn as number) - (job.timestamp as number)) / 1000
-    );
+    recordHistogramValue('medplum.subscription.totalDuration', ((job.finishedOn as number) - job.timestamp) / 1000);
   });
   worker.on('failed', (job) => {
     if (job) {
@@ -289,7 +291,7 @@ export async function addSubscriptionJobs(
   const subscriptions = await getSubscriptions(resource, project);
   logFn(`Evaluate ${subscriptions.length} subscription(s)`);
 
-  const wsEvents = [] as [Resource, string, SubEventsOptions][];
+  const wsSubEvents = [] as [string, SubEventsOptions][];
   for (const subscription of subscriptions) {
     if (isPreCommitSubscription(subscription)) {
       // Ignore pre-commit subscriptions
@@ -320,7 +322,7 @@ export async function addSubscriptionJobs(
         continue;
       }
       if (subscription.channel.type === 'websocket') {
-        wsEvents.push([resource, subscription.id, { includeResource: true }]);
+        wsSubEvents.push([subscription.id, { includeResource: true }]);
         continue;
       }
       await addSubscriptionJobData({
@@ -339,8 +341,8 @@ export async function addSubscriptionJobs(
     }
   }
 
-  if (wsEvents.length) {
-    await getRedis().publish('medplum:subscriptions:r4:websockets', JSON.stringify(wsEvents));
+  if (wsSubEvents.length) {
+    await getRedis().publish('medplum:subscriptions:r4:websockets', JSON.stringify({ resource, events: wsSubEvents }));
   }
 }
 
@@ -388,7 +390,7 @@ async function addSubscriptionJobData(job: SubscriptionJobData): Promise<void> {
  */
 async function getSubscriptions(resource: Resource, project: WithId<Project>): Promise<WithId<Subscription>[]> {
   const projectId = project.id;
-  const systemRepo = getSystemRepo();
+  const systemRepo = getProjectSystemRepo(projectId);
   const subscriptions = await systemRepo.searchResources<Subscription>({
     resourceType: 'Subscription',
     count: 1000,
@@ -406,8 +408,18 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
     ],
   });
   const redis = getRedis();
-  const setKey = `medplum:subscriptions:r4:project:${projectId}:active`;
-  const redisOnlySubRefStrs = await redis.smembers(setKey);
+  const hashKey = getActiveSubsKey(projectId, resource.resourceType);
+  const entries = await redis.hgetall(hashKey);
+  const redisOnlySubRefStrs: string[] = [];
+  for (const [ref, criteria] of Object.entries(entries)) {
+    try {
+      if (matchesSearchRequest(resource, parseSearchRequest(criteria))) {
+        redisOnlySubRefStrs.push(ref);
+      }
+    } catch (err) {
+      getLogger().warn('[WS] Error while evaluating criteria for subscription', { err, subscription: ref, criteria });
+    }
+  }
   if (redisOnlySubRefStrs.length) {
     const redisOnlySubStrs = await redis.mget(redisOnlySubRefStrs);
     if (project.features?.includes('websocket-subscriptions')) {
@@ -424,7 +436,7 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
             inactiveSubs.push(redisOnlySubRefStrs[i]);
           }
         }
-        await redis.srem(setKey, inactiveSubs);
+        await redis.hdel(hashKey, ...inactiveSubs);
       }
       const subArrStr = '[' + activeSubStrs.join(',') + ']';
       const inMemorySubs = JSON.parse(subArrStr) as { resource: WithId<Subscription>; projectId: string }[];
@@ -445,12 +457,13 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
  * @param job - The subscription job details.
  */
 export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promise<void> {
+  let systemRepo: SystemRepository;
   let subscription: WithId<Subscription> | undefined;
   let rewrittenResource: Resource;
 
   try {
-    const systemRepo = getSystemRepo();
     const { subscriptionId, resourceType, id, versionId, verbose } = job.data;
+    systemRepo = getShardSystemRepo(PLACEHOLDER_SHARD_ID); // job.data will eventually include shardId
     const logger = getLogger();
     const logFn = verbose ? logger.info : logger.debug;
 
@@ -506,7 +519,7 @@ export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promis
     // Errors in this try/catch are considered to be issues in the client's rest hook or bot
     // and should trigger retries according to the subscription's max attempts
     if (subscription.channel?.endpoint?.startsWith('Bot/')) {
-      await execBot(job, subscription, rewrittenResource, job.data.interaction, job.data.requestTime);
+      await execBot(systemRepo, job, subscription, rewrittenResource, job.data.interaction, job.data.requestTime);
     } else {
       await sendRestHook(job, subscription, rewrittenResource, job.data.interaction, job.data.requestTime);
     }
@@ -516,7 +529,7 @@ export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promis
 }
 
 async function tryGetSubscription(
-  systemRepo: Repository,
+  systemRepo: SystemRepository,
   subscriptionId: string,
   channelType: SubscriptionJobData['channelType']
 ): Promise<WithId<Subscription> | undefined> {
@@ -538,7 +551,7 @@ async function tryGetSubscription(
 }
 
 async function tryGetCurrentVersion<T extends Resource = Resource>(
-  systemRepo: Repository,
+  systemRepo: SystemRepository,
   resourceType: T['resourceType'],
   id: string
 ): Promise<T | undefined> {
@@ -584,6 +597,12 @@ async function sendRestHook(
 
   const fetchStartTime = Date.now();
   let fetchEndTime: number;
+  let systemRepo: SystemRepository;
+  if (subscription.meta?.project) {
+    systemRepo = getProjectSystemRepo(subscription.meta.project);
+  } else {
+    systemRepo = getGlobalSystemRepo(); // SHARDING is global correct if no project?
+  }
   try {
     log.info('Sending rest hook to: ' + url);
     log.debug('Rest hook headers: ' + JSON.stringify(headers, undefined, 2));
@@ -592,6 +611,7 @@ async function sendRestHook(
     log.info('Received rest hook status: ' + response.status);
     const success = isJobSuccessful(subscription, response.status);
     await createSubscriptionAuditEvent(
+      systemRepo,
       resource,
       requestTime,
       success ? AuditEventOutcome.Success : AuditEventOutcome.MinorFailure,
@@ -606,6 +626,7 @@ async function sendRestHook(
     fetchEndTime = Date.now();
     log.info('Subscription exception: ' + ex);
     await createSubscriptionAuditEvent(
+      systemRepo,
       resource,
       requestTime,
       AuditEventOutcome.MinorFailure,
@@ -654,11 +675,9 @@ function buildRestHookHeaders(
     headers['X-Medplum-Deleted-Resource'] = `${resource.resourceType}/${resource.id}`;
   }
 
-  if (subscription.channel?.header) {
-    for (const header of subscription.channel.header) {
-      const [key, value] = header.split(/:/);
-      headers[key.trim()] = value.trim();
-    }
+  for (const header of subscription.channel.header ?? EMPTY) {
+    const [key, value] = header.split(/:/);
+    headers[key.trim()] = value.trim();
   }
 
   // Look for signature secret in Medplum extension
@@ -684,6 +703,7 @@ function buildRestHookHeaders(
 
 /**
  * Executes a Bot subscription.
+ * @param systemRepo - The system repository.
  * @param job - The subscription job.
  * @param subscription - The subscription.
  * @param resource - The resource that triggered the subscription.
@@ -691,6 +711,7 @@ function buildRestHookHeaders(
  * @param requestTime - The request time.
  */
 async function execBot(
+  systemRepo: SystemRepository,
   job: Job<SubscriptionJobData>,
   subscription: WithId<Subscription>,
   resource: Resource,
@@ -706,10 +727,9 @@ async function execBot(
   }
 
   // URL should be a Bot reference string
-  const systemRepo = getSystemRepo();
   const bot = await systemRepo.readReference<Bot>({ reference: url });
 
-  const project = bot.meta?.project as string;
+  const project = subscription.meta?.project as string;
   const requester = resource.meta?.author as Reference<
     Bot | ClientApplication | Patient | Practitioner | RelatedPerson
   >;

@@ -57,6 +57,7 @@ export interface MedplumServerConfig {
   heartbeatEnabled?: boolean;
   accurateCountThreshold: number;
   maxSearchOffset?: number;
+  base64BinaryMaxBytes?: number;
   defaultSuperAdminEmail?: string;
   defaultSuperAdminPassword?: string;
   defaultSuperAdminClientId?: string;
@@ -126,6 +127,29 @@ export interface MedplumServerConfig {
   fhirSearchDiscourageSeqScan?: boolean;
 
   redactAuditEvents?: boolean;
+
+  /** Optional configuration for array column padding to mitigate statistics issues in Postgres. */
+  arrayColumnPadding?: {
+    [searchParamCode: string]:
+      | { resourceType?: string[]; config: ArrayColumnPaddingConfig }
+      | { resourceType?: string[]; config: ArrayColumnPaddingConfig }[];
+  };
+
+  /** TOTP authenticator window for MFA token validation (default: 1) */
+  mfaAuthenticatorWindow?: number;
+}
+
+export interface ArrayColumnPaddingConfig {
+  /** Count of distinct padding elements to choose from for padding elements  */
+  readonly m: number;
+  /**
+   * The lambda from the poisson distribution to achieve the desired padding
+   * element frequency with the desired confidence. See {@link https://github.com/medplum/medplum/issues/7539}
+   * or comments in `packages/server/src/fhir/token-column.ts` for in depth discussion.
+   */
+  readonly lambda: number;
+  /** The postgres statistics target for the array column */
+  readonly statisticsTarget: number;
 }
 
 /**

@@ -7,7 +7,7 @@ import type { Pool, PoolClient, PoolConfig, QueryArrayResult, QueryConfig, Query
 import pg from 'pg';
 import { Readable, Writable } from 'stream';
 import { loadConfig, loadTestConfig } from './config/loader';
-import type { MedplumDatabaseConfig, MedplumDatabaseSslConfig } from './config/types';
+import type { MedplumDatabaseSslConfig } from './config/types';
 import {
   acquireAdvisoryLock,
   closeDatabase,
@@ -17,6 +17,7 @@ import {
   initDatabase,
   releaseAdvisoryLock,
 } from './database';
+import { globalLogger } from './logger';
 import { GetDataVersionSql, GetVersionSql } from './migration-sql';
 import { getLatestPostDeployMigrationVersion, getPreDeployMigrationVersions } from './migrations/migration-versions';
 
@@ -122,6 +123,7 @@ describe('Database config', () => {
 
       return new MockPool();
     });
+    jest.spyOn(globalLogger, 'error').mockImplementation(() => {});
   });
 
   afterAll(() => {
@@ -145,7 +147,7 @@ describe('Database config', () => {
     expect(config.database).toBeDefined();
 
     const configCopy = deepClone(config);
-    const databaseConfig = configCopy.database as MedplumDatabaseConfig;
+    const databaseConfig = configCopy.database;
     const sslConfig = {
       rejectUnauthorized: true,
       require: true,
@@ -176,7 +178,7 @@ describe('Database config', () => {
     const configCopy = deepClone(config);
     configCopy.databaseProxyEndpoint = 'test';
 
-    const databaseConfig = configCopy.database as MedplumDatabaseConfig;
+    const databaseConfig = configCopy.database;
 
     await initDatabase(configCopy);
     expect(poolSpy).toHaveBeenCalledTimes(1);
