@@ -49,13 +49,19 @@ import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { getLogger, globalLogger } from '../logger';
 import type { AuthState } from '../oauth/middleware';
 import { recordHistogramValue } from '../otel/otel';
-import { getRedis, reconnectOnError } from '../redis';
+import { getActiveSubscriptions, publish, removeActiveSubscriptions } from '../pubsub';
+import { getCacheRedis } from '../redis';
 import type { SubEventsOptions } from '../subscriptions/websockets';
-import { getActiveSubsKey } from '../subscriptions/websockets';
 import { parseTraceparent } from '../traceparent';
 import { AuditEventOutcome, createSubscriptionAuditEvent } from '../util/auditevent';
 import type { WorkerInitializer } from './utils';
-import { addVerboseQueueLogging, findProjectMembership, isJobSuccessful, queueRegistry } from './utils';
+import {
+  addVerboseQueueLogging,
+  findProjectMembership,
+  getBullmqRedisConnectionOptions,
+  isJobSuccessful,
+  queueRegistry,
+} from './utils';
 
 /**
  * The timeout for outbound rest-hook subscription HTTP requests.
@@ -122,7 +128,7 @@ const jobName = 'SubscriptionJobData';
 
 export const initSubscriptionWorker: WorkerInitializer = (config) => {
   const defaultOptions: QueueBaseOptions = {
-    connection: { ...config.redis, reconnectOnError },
+    connection: getBullmqRedisConnectionOptions(config),
   };
 
   const queue = new Queue<SubscriptionJobData>(queueName, {
@@ -292,6 +298,10 @@ export async function addSubscriptionJobs(
   logFn(`Evaluate ${subscriptions.length} subscription(s)`);
 
   const wsSubEvents = [] as [string, SubEventsOptions][];
+  // Cache access policy results per (author, channel type) for the duration of this evaluation.
+  // Within one addSubscriptionJobs() call, `resource` and `project` are constant,
+  // so the boolean result is identical for all subscriptions sharing the same author AND channel type.
+  const accessPolicyCache = new Map<string, boolean>();
   for (const subscription of subscriptions) {
     if (isPreCommitSubscription(subscription)) {
       // Ignore pre-commit subscriptions
@@ -317,7 +327,18 @@ export async function addSubscriptionJobs(
       continue;
     }
     if (matches) {
-      if (!(await satisfiesAccessPolicy(resource, project, subscription))) {
+      const authorRef = getReferenceString(subscription.meta?.author as Reference);
+      // Channel type is part of the key because satisfiesAccessPolicy() is hardcoded to always
+      // return `true` for rest-hook subscriptions (see the TODO comment on that function).
+      // Without it, a cached `true` from a rest-hook sub could bypass the real policy check
+      // for a websocket sub sharing the same author.
+      const cacheKey = `${authorRef}:${subscription.channel.type}`;
+      let satisfied = accessPolicyCache.get(cacheKey);
+      if (satisfied === undefined) {
+        satisfied = await satisfiesAccessPolicy(resource, project, subscription);
+        accessPolicyCache.set(cacheKey, satisfied);
+      }
+      if (!satisfied) {
         logFn(`Subscription satisfiesAccessPolicy(${resource.id}) = false`);
         continue;
       }
@@ -342,7 +363,7 @@ export async function addSubscriptionJobs(
   }
 
   if (wsSubEvents.length) {
-    await getRedis().publish('medplum:subscriptions:r4:websockets', JSON.stringify({ resource, events: wsSubEvents }));
+    await publish('medplum:subscriptions:r4:websockets', JSON.stringify({ resource, events: wsSubEvents }));
   }
 }
 
@@ -407,21 +428,42 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
       },
     ],
   });
-  const redis = getRedis();
-  const hashKey = getActiveSubsKey(projectId, resource.resourceType);
-  const entries = await redis.hgetall(hashKey);
+
   const redisOnlySubRefStrs: string[] = [];
-  for (const [ref, criteria] of Object.entries(entries)) {
-    try {
-      if (matchesSearchRequest(resource, parseSearchRequest(criteria))) {
-        redisOnlySubRefStrs.push(ref);
+  const entries = await getActiveSubscriptions(projectId, resource.resourceType);
+  if (Object.keys(entries).length) {
+    const cachedCriteriaEvalMap = new Map<string, boolean>();
+    const wsEvalStartTime = Date.now();
+    for (const [ref, criteria] of Object.entries(entries)) {
+      try {
+        const cached = cachedCriteriaEvalMap.get(criteria);
+        let matches: boolean;
+
+        if (cached !== undefined) {
+          matches = cached;
+        } else {
+          matches = matchesSearchRequest(resource, parseSearchRequest(criteria));
+          cachedCriteriaEvalMap.set(criteria, matches);
+        }
+
+        if (matches) {
+          redisOnlySubRefStrs.push(ref);
+        }
+      } catch (err) {
+        getLogger().warn('[WS] Error while evaluating criteria for subscription', { err, subscription: ref, criteria });
       }
-    } catch (err) {
-      getLogger().warn('[WS] Error while evaluating criteria for subscription', { err, subscription: ref, criteria });
     }
+    getLogger().info('[WS] Evaluated active subscription criteria', {
+      projectId,
+      resourceType: resource.resourceType,
+      numSubscriptions: Object.keys(entries).length,
+      evalDurationMs: Date.now() - wsEvalStartTime,
+    });
   }
+
   if (redisOnlySubRefStrs.length) {
-    const redisOnlySubStrs = await redis.mget(redisOnlySubRefStrs);
+    const cacheRedis = getCacheRedis();
+    const redisOnlySubStrs = await cacheRedis.mget(redisOnlySubRefStrs);
     if (project.features?.includes('websocket-subscriptions')) {
       const activeSubStrs = redisOnlySubStrs.filter(Boolean);
       if (redisOnlySubStrs.length - activeSubStrs.length >= 50) {
@@ -436,7 +478,7 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
             inactiveSubs.push(redisOnlySubRefStrs[i]);
           }
         }
-        await redis.hdel(hashKey, ...inactiveSubs);
+        await removeActiveSubscriptions(projectId, resource.resourceType, inactiveSubs);
       }
       const subArrStr = '[' + activeSubStrs.join(',') + ']';
       const inMemorySubs = JSON.parse(subArrStr) as { resource: WithId<Subscription>; projectId: string }[];
