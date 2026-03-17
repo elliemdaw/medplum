@@ -49,16 +49,18 @@ import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { getLogger, globalLogger } from '../logger';
 import type { AuthState } from '../oauth/middleware';
 import { recordHistogramValue } from '../otel/otel';
-import { getActiveSubscriptions, publish, removeActiveSubscriptions } from '../pubsub';
+import type { ActiveSubscriptionEntry } from '../pubsub';
+import { cleanupActiveSubs, getActiveSubscriptions, publish, removeActiveSubscriptions } from '../pubsub';
 import { getCacheRedis } from '../redis';
 import type { SubEventsOptions } from '../subscriptions/websockets';
 import { parseTraceparent } from '../traceparent';
 import { AuditEventOutcome, createSubscriptionAuditEvent } from '../util/auditevent';
-import type { WorkerInitializer } from './utils';
+import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
 import {
   addVerboseQueueLogging,
   findProjectMembership,
   getBullmqRedisConnectionOptions,
+  getWorkerBullmqConfig,
   isJobSuccessful,
   queueRegistry,
 } from './utils';
@@ -126,7 +128,7 @@ function getLoggingFields(job: Job<SubscriptionJobData>): Record<string, string 
 const queueName = 'SubscriptionQueue';
 const jobName = 'SubscriptionJobData';
 
-export const initSubscriptionWorker: WorkerInitializer = (config) => {
+export const initSubscriptionWorker: WorkerInitializer = (config, options?: WorkerInitializerOptions) => {
   const defaultOptions: QueueBaseOptions = {
     connection: getBullmqRedisConnectionOptions(config),
   };
@@ -142,39 +144,43 @@ export const initSubscriptionWorker: WorkerInitializer = (config) => {
     },
   });
 
-  const worker = new Worker<SubscriptionJobData>(
-    queueName,
-    (job) =>
-      job.data.authState
-        ? runInAsyncContext(job.data.authState, job.data.requestId, job.data.traceId, () => execSubscriptionJob(job))
-        : tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execSubscriptionJob(job)),
-    {
-      ...defaultOptions,
-      ...config.bullmq,
-    }
-  );
-  addVerboseQueueLogging<SubscriptionJobData>(queue, worker, getLoggingFields);
-  worker.on('active', (job) => {
-    // Only record queuedDuration on the first attempt
-    if (job.attemptsMade === 0) {
-      recordHistogramValue('medplum.subscription.queuedDuration', (Date.now() - job.timestamp) / 1000);
-    }
-  });
-  worker.on('completed', (job) => {
-    recordHistogramValue(
-      'medplum.subscription.executionDuration',
-      ((job.finishedOn as number) - (job.processedOn as number)) / 1000
+  let worker: Worker<SubscriptionJobData> | undefined;
+  if (options?.workerEnabled !== false) {
+    const workerBullmq = getWorkerBullmqConfig(config, 'subscription');
+    worker = new Worker<SubscriptionJobData>(
+      queueName,
+      (job) =>
+        job.data.authState
+          ? runInAsyncContext(job.data.authState, job.data.requestId, job.data.traceId, () => execSubscriptionJob(job))
+          : tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execSubscriptionJob(job)),
+      {
+        ...defaultOptions,
+        ...workerBullmq,
+      }
     );
-    recordHistogramValue('medplum.subscription.totalDuration', ((job.finishedOn as number) - job.timestamp) / 1000);
-  });
-  worker.on('failed', (job) => {
-    if (job) {
+    addVerboseQueueLogging<SubscriptionJobData>(queue, worker, getLoggingFields);
+    worker.on('active', (job) => {
+      // Only record queuedDuration on the first attempt
+      if (job.attemptsMade === 0) {
+        recordHistogramValue('medplum.subscription.queuedDuration', (Date.now() - job.timestamp) / 1000);
+      }
+    });
+    worker.on('completed', (job) => {
       recordHistogramValue(
-        'medplum.subscription.failedExecutionDuration',
+        'medplum.subscription.executionDuration',
         ((job.finishedOn as number) - (job.processedOn as number)) / 1000
       );
-    }
-  });
+      recordHistogramValue('medplum.subscription.totalDuration', ((job.finishedOn as number) - job.timestamp) / 1000);
+    });
+    worker.on('failed', (job) => {
+      if (job) {
+        recordHistogramValue(
+          'medplum.subscription.failedExecutionDuration',
+          ((job.finishedOn as number) - (job.processedOn as number)) / 1000
+        );
+      }
+    });
+  }
 
   return { queue, worker, name: queueName };
 };
@@ -430,11 +436,22 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
   });
 
   const redisOnlySubRefStrs: string[] = [];
+  const expiredSubEntries: { [ref: string]: ActiveSubscriptionEntry } = {};
   const entries = await getActiveSubscriptions(projectId, resource.resourceType);
+
   if (Object.keys(entries).length) {
     const cachedCriteriaEvalMap = new Map<string, boolean>();
     const wsEvalStartTime = Date.now();
-    for (const [ref, criteria] of Object.entries(entries)) {
+
+    for (const [ref, entry] of Object.entries(entries)) {
+      const { criteria, expiration } = entry;
+      // Expiration comes directly from the JWT, so it's in seconds
+      // If it's less than Date.now(), add this subscription entry to the expired list
+      if (expiration * 1000 < Date.now()) {
+        expiredSubEntries[ref] = entry;
+        continue;
+      }
+
       try {
         const cached = cachedCriteriaEvalMap.get(criteria);
         let matches: boolean;
@@ -461,12 +478,23 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
     });
   }
 
+  // We should clean up all expired sub entries ASAP
+  if (Object.keys(expiredSubEntries).length) {
+    await cleanupActiveSubs(projectId, expiredSubEntries);
+  }
+
   if (redisOnlySubRefStrs.length) {
     const cacheRedis = getCacheRedis();
     const redisOnlySubStrs = await cacheRedis.mget(redisOnlySubRefStrs);
     if (project.features?.includes('websocket-subscriptions')) {
       const activeSubStrs = redisOnlySubStrs.filter(Boolean);
-      if (redisOnlySubStrs.length - activeSubStrs.length >= 50) {
+      // This used to be set to 50 because we evaluated every Subscription for the entire project at this point
+      // However, we now store the Subscription criteria and use that to filter before doing the mget above,
+      // Which means by this point only Subscriptions with not only the same resource type but also have matching criteria
+      // Would be in the list by now
+      // That means for subscriptions with niche criteria we may not get enough subs to trigger any GC unless the threshold is pretty low
+      // Trying 5 for now (50 -> 5)
+      if (redisOnlySubStrs.length - activeSubStrs.length >= 5) {
         getLogger().warn('Excessive subscription cache miss', {
           numKeys: redisOnlySubRefStrs.length,
           hitRate: activeSubStrs.length / redisOnlySubStrs.length,

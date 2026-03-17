@@ -314,6 +314,58 @@ describe('Config', () => {
     });
   });
 
+  test('Env config workers prefix', async () => {
+    setEnv('MEDPLUM_BASE_URL', 'http://localhost:3000');
+    setEnv('MEDPLUM_WORKERS_ENABLED', '["subscription","cron"]');
+
+    const config = await loadConfig('env');
+    expect(config.workers).toBeDefined();
+    expect(config.workers?.enabled).toStrictEqual(['subscription', 'cron']);
+  });
+
+  test('Env config workers bullmq prefix', async () => {
+    setEnv('MEDPLUM_BASE_URL', 'http://localhost:3000');
+    setEnv('MEDPLUM_WORKERS_BULLMQ', '{"subscription":{"concurrency":50}}');
+
+    const config = await loadConfig('env');
+    expect(config.workers).toBeDefined();
+    expect(config.workers?.bullmq).toStrictEqual({ subscription: { concurrency: 50 } });
+  });
+
+  test('Multi-source: file then env overlay', async () => {
+    setEnv('MEDPLUM_PORT', '9999');
+
+    const config = await loadConfig('file:medplum.config.json,env');
+    // baseUrl comes from file
+    expect(config.baseUrl).toBeDefined();
+    // port comes from env overlay
+    expect(config.port).toStrictEqual(9999);
+  });
+
+  test('Multi-source: deep merge preserves unrelated nested fields', async () => {
+    setEnv('MEDPLUM_DATABASE_PORT', '5433');
+
+    const config = await loadConfig('file:medplum.config.json,env');
+    // database.port overridden by env
+    expect(config.database.port).toStrictEqual(5433);
+    // database.host preserved from file
+    expect(config.database.host).toBeDefined();
+  });
+
+  test('Multi-source: single source backwards compatibility', async () => {
+    const config = await loadConfig('file:medplum.config.json');
+    expect(config.baseUrl).toBeDefined();
+  });
+
+  test('Multi-source: empty and trailing comma segments skipped', async () => {
+    const config = await loadConfig('file:medplum.config.json,,');
+    expect(config.baseUrl).toBeDefined();
+  });
+
+  test('Multi-source: empty config name throws', async () => {
+    await expect(loadConfig('')).rejects.toThrow('Empty config name');
+  });
+
   test('loadTestConfig', async () => {
     const config = await loadTestConfig();
     expect(config).toBeDefined();
