@@ -9,6 +9,7 @@ import { initApp, shutdownApp } from '../../app';
 import { registerNew } from '../../auth/register';
 import { loadTestConfig } from '../../config/loader';
 import { DatabaseMode, getDatabasePool } from '../../database';
+import { getCacheRedis } from '../../redis';
 import { addTestUser, createTestProject, withTestContext } from '../../test.setup';
 import { Repository } from '../repo';
 import * as searchFile from '../search';
@@ -46,7 +47,7 @@ describe('GraphQL', () => {
       });
 
       // Create a profile picture
-      binary = await aliceRepo.createResource<Binary>({ resourceType: 'Binary' } as Binary);
+      binary = await aliceRepo.createResource({ resourceType: 'Binary' } as Binary);
 
       // Creat a simple patient
       patient = await aliceRepo.createResource<Patient>({
@@ -106,20 +107,22 @@ describe('GraphQL', () => {
 
       // Invite Bob with the access policy
       const bobRegistration = await addTestUser(aliceRegistration.project, {
-        resourceType: 'AccessPolicy',
-        resource: [
-          {
-            resourceType: 'Encounter',
-          },
-          {
-            resourceType: 'Patient',
-            hiddenFields: ['telecom'],
-          },
-          {
-            resourceType: 'ServiceRequest',
-            criteria: 'ServiceRequest?status=completed',
-          },
-        ],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          resource: [
+            {
+              resourceType: 'Encounter',
+            },
+            {
+              resourceType: 'Patient',
+              hiddenFields: ['telecom'],
+            },
+            {
+              resourceType: 'ServiceRequest',
+              criteria: 'ServiceRequest?status=completed',
+            },
+          ],
+        },
       });
       bobAccessToken = bobRegistration.accessToken;
     });
@@ -1042,25 +1045,29 @@ describe('GraphQL', () => {
       hasId(obs);
 
       const { accessToken: restrictedAccessToken } = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        resource: [
-          {
-            resourceType: 'Patient',
-          },
-        ],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          resource: [
+            {
+              resourceType: 'Patient',
+            },
+          ],
+        },
       });
 
       const { accessToken: hiddenBodySiteAccessToken } = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        resource: [
-          {
-            resourceType: 'Patient',
-          },
-          {
-            resourceType: 'Observation',
-            hiddenFields: ['bodySite'],
-          },
-        ],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          resource: [
+            {
+              resourceType: 'Patient',
+            },
+            {
+              resourceType: 'Observation',
+              hiddenFields: ['bodySite'],
+            },
+          ],
+        },
       });
 
       // No AccessPolicy
@@ -1229,6 +1236,45 @@ describe('GraphQL', () => {
     const secondId = res2.body.data.EncounterConnection.edges[0].resource.id;
     expect([encounter1.id, encounter2.id]).toContain(secondId);
     expect(res2.body.data.EncounterConnection.next).toBeDefined();
+  });
+
+  test('dataloader deduplicates reads', async () => {
+    const patRes = await request(app)
+      .post('/fhir/R4/Patient')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Patient',
+        name: [{ text: 'Charlie Smith' }],
+        generalPractitioner: [createReference(practitioner)],
+      } satisfies Patient);
+    expect(patRes.status).toBe(201);
+
+    const redis = getCacheRedis();
+    const mgetSpy = jest.spyOn(redis, 'mget');
+
+    const res = await request(app)
+      .post('/fhir/R4/$graphql')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.JSON)
+      .send({
+        query: `
+      {
+        PatientList(name: "Smith") {
+          id
+          generalPractitioner {
+            resource {
+              ... on Practitioner { id }
+            }
+          }
+        }
+      }
+    `,
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.data.PatientList).toBeDefined();
+    // Only one instance of the practitioner ID should be looked up
+    expect(mgetSpy).toHaveBeenCalledWith([getReferenceString(practitioner)]);
   });
 });
 

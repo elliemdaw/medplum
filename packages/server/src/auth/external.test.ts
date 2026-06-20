@@ -10,7 +10,7 @@ import request from 'supertest';
 import { createClient } from '../admin/client';
 import { inviteUser } from '../admin/invite';
 import { initApp, shutdownApp } from '../app';
-import { loadTestConfig } from '../config/loader';
+import { getConfig, loadTestConfig } from '../config/loader';
 import type { SystemRepository } from '../fhir/repo';
 import { getProjectSystemRepo } from '../fhir/repo';
 import { withTestContext } from '../test.setup';
@@ -56,7 +56,7 @@ describe('External', () => {
       project = registerResult.project;
       defaultClient = registerResult.client;
 
-      systemRepo = getProjectSystemRepo(project);
+      systemRepo = await getProjectSystemRepo(project);
 
       // Create a domain configuration with external identity provider
       await systemRepo.createResource<DomainConfiguration>({
@@ -81,7 +81,11 @@ describe('External', () => {
       // Update client application with external auth
       await systemRepo.updateResource<ClientApplication>({
         ...externalAuthClient,
-        identityProvider,
+        identityProvider: {
+          ...identityProvider,
+          identitySource: 'email',
+          identityMappingMode: 'user-email',
+        },
       });
 
       // Invite user with external ID
@@ -228,6 +232,38 @@ describe('External', () => {
     expect(redirect.searchParams.get('login')).toBeTruthy();
   });
 
+  test('Server config identity provider success', async () => {
+    const issuer = `https://${randomUUID()}.example.com`;
+    const config = getConfig();
+    const externalAuthProviders = config.externalAuthProviders;
+    config.externalAuthProviders = [{ issuer, identityProvider }];
+
+    try {
+      const url = appendQueryParams('/auth/external', {
+        code: randomUUID(),
+        state: JSON.stringify({ issuer }),
+      });
+
+      // Mock the external identity provider
+      (fetch as unknown as jest.Mock).mockImplementation(() => ({
+        ok: true,
+        status: 200,
+        json: () => buildTokens(email),
+      }));
+
+      // Simulate the external identity provider callback
+      const res = await request(app).get(url);
+      expect(res.status).toBe(302);
+
+      const redirect = new URL(res.header.location);
+      expect(redirect.host).toStrictEqual('localhost:3000');
+      expect(redirect.pathname).toStrictEqual('/signin');
+      expect(redirect.searchParams.get('login')).toBeTruthy();
+    } finally {
+      config.externalAuthProviders = externalAuthProviders;
+    }
+  });
+
   test('ClientApplication success', async () => {
     const url = appendQueryParams('/auth/external', {
       code: randomUUID(),
@@ -352,6 +388,33 @@ describe('External', () => {
     expect(res.body.issue[0].details.text).toBe('Failed to verify code - check your identity provider configuration');
   });
 
+  test('Token request includes Accept-Encoding: identity', async () => {
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: externalAuthClient.id }),
+    });
+
+    // Mock the external identity provider
+    (fetch as unknown as jest.Mock).mockImplementation(() => ({
+      ok: true,
+      status: 200,
+      json: () => buildTokens('test@' + domain),
+    }));
+
+    // Simulate the external identity provider callback
+    await request(app).get(url);
+
+    // Verify fetch was called with Accept-Encoding: identity to prevent gzip responses
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'Accept-Encoding': 'identity',
+        }),
+      })
+    );
+  });
+
   test('Subject auth success', async () => {
     const subjectAuthClient = await withTestContext(async () => {
       // Create a new client application with external subject auth
@@ -366,7 +429,8 @@ describe('External', () => {
         ...client,
         identityProvider: {
           ...identityProvider,
-          useSubject: true,
+          identitySource: 'subject',
+          identityMappingMode: 'project-membership-external-id',
         },
       });
 
@@ -406,6 +470,94 @@ describe('External', () => {
       code_verifier: 'xyz',
     });
     expect(tokenResponse.body.profile.display).toBe('External User');
+  });
+
+  test('Block partial redirect URI match', async () => {
+    const subjectAuthClient = await withTestContext(async () => {
+      // Create a new client application with external subject auth
+      const client = await createClient(systemRepo, {
+        project,
+        name: 'Subject Auth Client',
+        redirectUri,
+      });
+
+      // Update client application with external auth
+      await systemRepo.updateResource<ClientApplication>({
+        ...client,
+        identityProvider: {
+          ...identityProvider,
+          useSubject: true,
+        },
+      });
+
+      return client;
+    });
+
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({
+        redirectUri: redirectUri + '/extra',
+        clientId: subjectAuthClient.id,
+        codeChallenge: 'xyz',
+        codeChallengeMethod: 'plain',
+      }),
+    });
+
+    // Mock the external identity provider
+    (fetch as unknown as jest.Mock).mockImplementation(() => ({
+      ok: true,
+      status: 200,
+      json: () => buildTokens('', externalId),
+    }));
+
+    // Simulate the external identity provider callback
+    const res = await request(app).get(url);
+    expect(res.status).toBe(400);
+    expect(res.body.issue[0].details.text).toBe('Invalid redirect URI');
+  });
+
+  test('Block redirect URI with different host', async () => {
+    const subjectAuthClient = await withTestContext(async () => {
+      // Create a new client application with external subject auth
+      const client = await createClient(systemRepo, {
+        project,
+        name: 'Subject Auth Client',
+        redirectUri,
+      });
+
+      // Update client application with external auth
+      await systemRepo.updateResource<ClientApplication>({
+        ...client,
+        identityProvider: {
+          ...identityProvider,
+          useSubject: true,
+        },
+      });
+
+      return client;
+    });
+
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({
+        redirectUri: redirectUri + '.evil.com',
+        clientId: subjectAuthClient.id,
+        codeChallenge: 'xyz',
+        codeChallengeMethod: 'plain',
+      }),
+    });
+
+    // Mock the external identity provider
+    (fetch as unknown as jest.Mock).mockImplementation(() => ({
+      ok: true,
+      status: 200,
+      json: () => buildTokens('', externalId),
+    }));
+
+    // Simulate the external identity provider callback
+    const res = await request(app).get(url);
+    expect(res.status).toBe(400);
+    expect(res.body.issue[0].details.text).toBe('Invalid redirect URI');
   });
 
   test('Missing subject', async () => {
@@ -507,6 +659,124 @@ describe('External', () => {
       code_verifier: 'xyz',
     });
     expect(tokenResponse.body.profile.display).toBe('External Text');
+  });
+
+  test('returnTo URL is followed when explicitly allowed by DomainConfiguration', async () => {
+    const testDomain = randomUUID() + '.example.com';
+    const testEmail = `text@${testDomain}`;
+    const allowedReturnTo = 'https://myapp.example.com';
+
+    await withTestContext(async () => {
+      // Create a new project and user for this test
+      const { project: testProject } = await registerNew({
+        firstName: 'External',
+        lastName: 'Text',
+        projectName: 'External Test Project - returnTo',
+        email: testEmail,
+        password: 'password!@#',
+        remoteAddress: '5.5.5.5',
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/107.0.0.0',
+      });
+
+      const testRepo = await getProjectSystemRepo(testProject);
+      await testRepo.createResource<DomainConfiguration>({
+        resourceType: 'DomainConfiguration',
+        domain: testDomain,
+        identityProvider,
+        allowedPostLoginRedirectUrls: [allowedReturnTo],
+      });
+    });
+
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ domain: testDomain, returnTo: allowedReturnTo + '/dashboard' }),
+    });
+
+    (fetch as unknown as jest.Mock).mockImplementation(() => ({
+      ok: true,
+      status: 200,
+      json: () => buildTokens(testEmail),
+    }));
+
+    const res = await request(app).get(url);
+    expect(res.status).toBe(302);
+
+    const redirect = new URL(res.header.location);
+    expect(redirect.hostname).toStrictEqual('myapp.example.com');
+    expect(redirect.pathname).toStrictEqual('/dashboard');
+    expect(redirect.searchParams.get('login')).toBeTruthy();
+  });
+
+  test('returnTo URL is ignored when not in allowedPostLoginRedirectUrls', async () => {
+    // The domain config for `domain` has no allowedPostLoginRedirectUrls,
+    // so any returnTo should be ignored and the user falls back to /signin.
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ domain, returnTo: 'https://evil.example.com/steal' }),
+    });
+
+    (fetch as unknown as jest.Mock).mockImplementation(() => ({
+      ok: true,
+      status: 200,
+      json: () => buildTokens(email),
+    }));
+
+    const res = await request(app).get(url);
+    expect(res.status).toBe(302);
+
+    const redirect = new URL(res.header.location);
+    expect(redirect.host).toStrictEqual('localhost:3000');
+    expect(redirect.pathname).toStrictEqual('/signin');
+    expect(redirect.searchParams.get('login')).toBeTruthy();
+  });
+
+  test('returnTo URL with confused domain is rejected', async () => {
+    const testDomain = randomUUID() + '.example.com';
+    const testEmail = `text@${testDomain}`;
+    const allowedReturnTo = 'https://myapp.example.com';
+
+    await withTestContext(async () => {
+      const { project: testProject } = await registerNew({
+        firstName: 'External',
+        lastName: 'Text',
+        projectName: 'External Test Project - confused domain',
+        email: testEmail,
+        password: 'password!@#',
+        remoteAddress: '5.5.5.5',
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/107.0.0.0',
+      });
+
+      const testRepo = await getProjectSystemRepo(testProject);
+      await testRepo.createResource<DomainConfiguration>({
+        resourceType: 'DomainConfiguration',
+        domain: testDomain,
+        identityProvider,
+        allowedPostLoginRedirectUrls: [allowedReturnTo],
+      });
+    });
+
+    // Attempt to use a confused domain that starts with the allowed URL
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({
+        domain: testDomain,
+        returnTo: 'https://myapp.example.com.evil.com/steal',
+      }),
+    });
+
+    (fetch as unknown as jest.Mock).mockImplementation(() => ({
+      ok: true,
+      status: 200,
+      json: () => buildTokens(testEmail),
+    }));
+
+    const res = await request(app).get(url);
+    expect(res.status).toBe(302);
+
+    // Should fall back to default signin, NOT redirect to evil.com
+    const redirect = new URL(res.header.location);
+    expect(redirect.host).toStrictEqual('localhost:3000');
+    expect(redirect.pathname).toStrictEqual('/signin');
   });
 
   test('Legacy User.externalId support', async () => {

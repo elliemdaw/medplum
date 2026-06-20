@@ -242,7 +242,7 @@ describe('ConditionList', () => {
     medplum.valueSetExpand = vi
       .fn()
       .mockImplementation(async (params: { url: string; filter?: string; count?: number }) => {
-        if (params.url === 'http://hl7.org/fhir/sid/icd-10-cm/vs') {
+        if (params.url === 'http://hl7.org/fhir/sid/icd-10-cm/vs/billable') {
           const choleraCodes = [
             {
               system: 'http://hl7.org/fhir/sid/icd-10-cm',
@@ -359,7 +359,7 @@ describe('ConditionList', () => {
           const calls = vi.mocked(medplum.valueSetExpand).mock.calls;
           const choleraCall = calls.find(
             (call) =>
-              call[0]?.url === 'http://hl7.org/fhir/sid/icd-10-cm/vs' &&
+              call[0]?.url === 'http://hl7.org/fhir/sid/icd-10-cm/vs/billable' &&
               call[0]?.filter?.toLowerCase().includes('cholera')
           );
           expect(choleraCall).toBeDefined();
@@ -385,10 +385,11 @@ describe('ConditionList', () => {
       });
     }
 
-    // Find Status input
+    // After selecting the ICD-10 code with maxValues={1}, the ICD-10 searchbox is
+    // removed and only the Status searchbox remains.
     await waitFor(() => {
       const inputs = screen.getAllByRole('searchbox');
-      expect(inputs.length).toBeGreaterThan(1);
+      expect(inputs.length).toBeGreaterThan(0);
     });
 
     const statusInputs = screen.getAllByRole('searchbox');
@@ -397,9 +398,9 @@ describe('ConditionList', () => {
       return label?.textContent?.includes('Status');
     });
 
-    // Fallback to second input if label search doesn't work
-    if (!statusInput && statusInputs.length > 1) {
-      statusInput = statusInputs[1];
+    // Fallback to first remaining input if label search doesn't work
+    if (!statusInput && statusInputs.length > 0) {
+      statusInput = statusInputs[0];
     }
 
     expect(statusInput).toBeDefined();

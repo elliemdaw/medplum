@@ -316,11 +316,23 @@ Optional SMTP email settings to use SMTP for email. See [Sending SMTP Emails](/d
 
 **Default:** None
 
+#### smtp.secure
+
+Optional flag to use TLS when connecting to the SMTP relay (TLS-on-connect, as opposed to STARTTLS upgrade). Set to `true` for relays using implicit TLS, typically on port 465.
+
+**Default:** `false`
+
 ### emailProvider
 
 Optional email provider setting. Can be one of: `'none'`, `'awsses'`, `'smtp'`.
 
 **Default:** `'awsses'` if in AWS, otherwise `'none'`
+
+### allowProjectSmtp
+
+Optional flag to allow projects to send email through their own SMTP relay, configured via `Project.secret` entries. See [Project SMTP](/docs/user-management/project-smtp) for more details. Set to `false` to force all emails through the server-wide email provider.
+
+**Default:** `true`
 
 ### bullmq
 
@@ -347,12 +359,122 @@ See [BullMQ Job Removal](https://docs.bullmq.io/guide/jobs/auto-removal).
 
 **Default:** `false`
 
+### dataWarehouse
+
+Optional configuration for the scheduled Data Warehouse sync worker. This worker runs incremental sync jobs via BullMQ on a fixed cron schedule.
+It uses `readonlyDatabase` connection settings when available; otherwise it falls back to `database`.
+History tables synced are every `{ResourceType}_History` name derived from indexed repository resource types (the same pattern as database migrations), not a separate configurable list.
+
+When `dataWarehouse.enabled` is `true`, you must set `cron` and `destination`. There is no default destination. You must also set the fields required for your chosen destination: `awsS3TableArn` and `namespace` for `s3tables`, or `localBasePath` for `local`.
+
+Example (`s3tables`):
+
+```json
+{
+  "dataWarehouse": {
+    "enabled": true,
+    "cron": "0 * * * *",
+    "destination": "s3tables",
+    "awsS3TableArn": "arn:aws:s3tables:us-east-1:123456789012:bucket/my-warehouse",
+    "namespace": "default"
+  }
+}
+```
+
+Example (`local`):
+
+```json
+{
+  "dataWarehouse": {
+    "enabled": true,
+    "cron": "0 * * * *",
+    "destination": "local",
+    "localBasePath": "/var/medplum/warehouse"
+  }
+}
+```
+
+#### dataWarehouse.enabled
+
+Enable or disable the scheduled Data Warehouse sync worker.
+
+**Default:** `false`
+
+#### dataWarehouse.cron
+
+Cron expression used for scheduling sync runs.
+
+**Required when:** `dataWarehouse.enabled` is `true`
+
+**Default:** None
+
+#### dataWarehouse.destination
+
+Warehouse export destination type.
+
+- `s3tables`: Managed Iceberg tables in Amazon S3 Tables. Uses the top-level [`awsRegion`](#awsregion) for AWS API and DuckDB S3 credentials.
+- `local`: Write per-table Parquet files to `dataWarehouse.localBasePath`.
+
+**Required when:** `dataWarehouse.enabled` is `true`
+
+**Default:** None
+
+#### dataWarehouse.awsS3TableArn
+
+AWS S3 Table ARN for managed Iceberg table access.
+
+**Required when:** `dataWarehouse.destination` is `s3tables`
+
+**Default:** None
+
+#### dataWarehouse.localBasePath
+
+Base output directory for local Parquet exports. Each repository history table is written as `<table_key>.parquet` under this directory.
+
+**Required when:** `dataWarehouse.destination` is `local`
+
+**Default:** None
+
+#### dataWarehouse.namespace
+
+Iceberg namespace used by sync when using the `s3tables` destination.
+
+**Required when:** `dataWarehouse.destination` is `s3tables`
+
+**Default:** None
+
+#### dataWarehouse.startDate
+
+Earliest resource `lastUpdated` timestamp to include in warehouse sync (ISO 8601 string in JSON or environment config). History rows older than this bound are excluded from export.
+
+**Default:** None (no lower bound; sync all history rows that pass other filters)
+
 ### awsRegion
 
 The AWS Region identifier.
 
 **Created by:** `cdk`
 **Default:** `us-east-1`
+
+### sseCustomerKey
+
+Optional base64-encoded 256-bit key for S3 Server-Side Encryption with Customer-Provided Keys (SSE-C). When set, all S3 operations (upload, download, copy, presigned URLs) will use SSE-C encryption with the `AES256` algorithm.
+
+To generate a suitable key:
+
+```bash
+openssl rand -base64 32
+```
+
+:::caution[]
+You must store this key securely. If the key is lost, all data encrypted with it becomes permanently inaccessible. AWS does not store or manage SSE-C keys.
+:::
+
+:::warning[]
+Enabling SSE-C does not retroactively encrypt existing objects in the S3 bucket. Only new uploads will be encrypted. To encrypt existing data, you must re-upload the objects (e.g., using `aws s3 cp` with the `--sse-c` flags).
+:::
+
+**Default:** None
 
 ### accurateCountThreshold
 
@@ -413,7 +535,7 @@ Limit for the total number of FHIR request that can be sent to to processed by t
 
 **Default:** `50000`
 
-:::tip Local Config
+:::tip[Local Config]
 To make changes to the server config after your first deploy, you must the edit parameter values _directly in AWS parameter store_
 
 To make changes to settings that affect your deployed Medplum App, you must _also_ make these changes to your local configuration json file.
@@ -651,7 +773,7 @@ Example `DatabaseSecrets` value:
 }
 ```
 
-:::note Query Timeout
+:::note[Query Timeout]
 The `queryTimeout` parameter controls how long the database will allow a query to run before terminating it. If this
 parameter is set too high, expensive queries will be allowed to run on the DB, potentially even after the associated
 request has returned a server timeout error. If set too low, some queries may start to fail if they hit the

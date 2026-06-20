@@ -22,9 +22,8 @@ import { getShardSystemRepo } from '../fhir/repo';
 import { minCursorBasedSearchPageSize } from '../fhir/search';
 import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { globalLogger } from '../logger';
-import { getPostDeployVersion } from '../migration-sql';
 import type { PostDeployJobData, PostDeployMigration } from '../migrations/data/types';
-import { MigrationVersion } from '../migrations/migration-versions';
+import { isFirstBootMode } from '../migrations/migration-utils';
 import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
 import {
   addVerboseQueueLogging,
@@ -170,8 +169,7 @@ export class ReindexJob {
   }
 
   private async maybeSkipJob(asyncJob: WithId<AsyncJob>): Promise<boolean> {
-    const postDeployVersion = await getPostDeployVersion(getDatabasePool(DatabaseMode.WRITER));
-    if (Boolean(asyncJob.dataVersion) && postDeployVersion === MigrationVersion.FIRST_BOOT) {
+    if (Boolean(asyncJob.dataVersion) && (await isFirstBootMode(getDatabasePool(DatabaseMode.WRITER)))) {
       this.logger.info('Skipping reindex post-deploy migration since server is in firstBoot mode', {
         asyncJob: getReferenceString(asyncJob),
         version: `v${asyncJob.dataVersion}`,
@@ -312,7 +310,7 @@ export class ReindexJob {
     let cursor = '';
     let nextTimestamp = new Date(0).toISOString();
     try {
-      await systemRepo.withTransaction(async (conn) => {
+      await systemRepo.withTransaction(async (txRepo) => {
         /*
         When a ReindexJob needs to scan a very large table for resources to reindex,
         but most/all have already been reindexed, the search will scan the most/all of table
@@ -330,10 +328,11 @@ export class ReindexJob {
         ORDER BY "Task"."lastUpdated" LIMIT 501
         ```
         */
+        const conn = txRepo.getDatabaseClient(DatabaseMode.WRITER);
         let bundle: Bundle<WithId<Resource>>;
         try {
           await conn.query(`SELECT set_config('statement_timeout', $1, true)`, [String(searchStatementTimeout)]);
-          bundle = await systemRepo.search(searchRequest, { maxResourceVersion });
+          bundle = await txRepo.search(searchRequest, { maxResourceVersion });
         } finally {
           if (upsertStatementTimeout === 'DEFAULT') {
             await conn.query(`RESET statement_timeout`);
@@ -343,7 +342,7 @@ export class ReindexJob {
         }
         if (bundle.entry?.length) {
           const resources = bundle.entry.map((e) => e.resource as WithId<Resource>);
-          await systemRepo.reindexResources(conn, resources);
+          await txRepo.reindexResources(resources);
           newCount += resources.length;
           nextTimestamp = bundle.entry.at(-1)?.resource?.meta?.lastUpdated ?? nextTimestamp;
         }

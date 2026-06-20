@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { ProfileResource, WithId } from '@medplum/core';
-import { badRequest, createReference, OperationOutcomeError, Operator, resolveId } from '@medplum/core';
+import {
+  badRequest,
+  createReference,
+  getReferenceString,
+  OperationOutcomeError,
+  Operator,
+  resolveId,
+} from '@medplum/core';
 import type {
   ContactPoint,
   Login,
@@ -18,7 +25,7 @@ import { authenticator } from 'otplib';
 import { toDataURL } from 'qrcode';
 import { getConfig } from '../config/loader';
 import { sendOutcome } from '../fhir/outcomes';
-import type { Repository, SystemRepository } from '../fhir/repo';
+import type { SystemRepository } from '../fhir/repo';
 import { getGlobalSystemRepo, getShardSystemRepo } from '../fhir/repo';
 import { rewriteAttachments, RewriteMode } from '../fhir/rewrite';
 import { TODO_SHARD_ID } from '../fhir/sharding';
@@ -40,7 +47,7 @@ export async function createProfile(
     telecom = [{ system: 'email', use: 'work', value: email }];
   }
 
-  const result = await systemRepo.createResource<ProfileResource>({
+  const result = await systemRepo.createResource({
     resourceType,
     meta: {
       project: project.id,
@@ -58,7 +65,7 @@ export async function createProfile(
 }
 
 export async function createProjectMembership(
-  repo: Repository,
+  systemRepo: SystemRepository,
   user: User,
   project: Project,
   profile: ProfileResource,
@@ -67,7 +74,7 @@ export async function createProjectMembership(
   const logger = getLogger();
   logger.info('Creating project membership', { name: project.name });
 
-  const result = await repo.createResource<ProjectMembership>({
+  const result = await systemRepo.createResource<ProjectMembership>({
     ...details,
     resourceType: 'ProjectMembership',
     project: createReference(project),
@@ -123,9 +130,18 @@ export async function sendLoginResult(res: Response, login: Login): Promise<void
   // Safe to rewrite attachments,
   // because we know that these are all resources that the user has access to
   const memberships = await getMembershipsForLogin(login);
+  const uniqueRefs = [...new Map(memberships.map((m) => [m.project.reference, m.project])).values()];
+  const projects = await systemRepo.readReferences<Project>(uniqueRefs);
+  const freshProjectMap = new Map<string, Reference<Project>>();
+  for (const project of projects) {
+    if (!(project instanceof Error)) {
+      freshProjectMap.set(getReferenceString(project), createReference(project));
+    }
+  }
+
   const redactedMemberships = memberships.map((m) => ({
     id: m.id,
-    project: m.project,
+    project: m.project.reference ? freshProjectMap.get(m.project.reference) : m.project,
     profile: m.profile,
     identifier: m.identifier,
   }));
@@ -168,7 +184,7 @@ export async function verifyRecaptcha(secretKey: string, recaptchaToken: string)
     '&response=' +
     encodeURIComponent(recaptchaToken);
 
-  const response = await fetch(url, { method: 'POST' });
+  const response = await fetch(url, { method: 'POST', headers: { 'Accept-Encoding': 'identity' } });
   const json = (await response.json()) as { success: boolean };
   return json.success;
 }

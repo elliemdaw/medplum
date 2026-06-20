@@ -99,7 +99,7 @@ describe('MemoryRepository', () => {
   test('Read invalid reference', async () => {
     try {
       await repo.readReference({});
-      fail('Expected error');
+      expect.fail('Expected error');
     } catch (err) {
       const outcome = (err as OperationOutcomeError).outcome;
       expect(outcome).toMatchObject(badRequest('Invalid reference'));
@@ -115,7 +115,7 @@ describe('MemoryRepository', () => {
 
     try {
       await repo.readVersion<Patient>('Patient', patient.id, randomUUID());
-      fail('Expected error');
+      expect.fail('Expected error');
     } catch (err) {
       const outcome = (err as OperationOutcomeError).outcome;
       expect(outcome).toMatchObject(notFound);
@@ -124,7 +124,7 @@ describe('MemoryRepository', () => {
 
   test('Count and offset', async () => {
     for (let i = 0; i < 10; i++) {
-      await repo.createResource<Observation>({ resourceType: 'Observation' } as Observation);
+      await repo.createResource({ resourceType: 'Observation' } as Observation);
     }
 
     const bundle = await repo.search({ resourceType: 'Observation', offset: 1, count: 1 });
@@ -208,7 +208,7 @@ describe('MemoryRepository', () => {
       const resources = [];
       for (let i = 0; i < count; i++) {
         resources.push(
-          await repo.createResource<Observation>({
+          await repo.createResource({
             resourceType: 'Observation',
             subject: createReference(patient),
             valueString: i.toString(),

@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { Button, Group, SegmentedControl, Title } from '@mantine/core';
+import { EMPTY, getReferenceString } from '@medplum/core';
 import type { Appointment, Slot } from '@medplum/fhirtypes';
 import { IconChevronLeft, IconChevronRight } from '@tabler/icons-react';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 import type { JSX } from 'react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Event, SlotInfo, ToolbarProps, View } from 'react-big-calendar';
 import { Calendar as ReactBigCalendar, dayjsLocalizer } from 'react-big-calendar';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import type { Range } from '../types/scheduling';
-import { SchedulingTransientIdentifier } from '../utils/scheduling';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -21,6 +21,8 @@ dayjs.tz.setDefault(dayjs.tz.guess());
 type AppointmentEvent = Event & { type: 'appointment'; appointment: Appointment; start: Date; end: Date };
 type SlotEvent = Event & { type: 'slot'; slot: Slot; status: string; start: Date; end: Date };
 type ScheduleEvent = AppointmentEvent | SlotEvent;
+
+const localizer = dayjsLocalizer(dayjs);
 
 export const CalendarToolbar = (props: ToolbarProps<ScheduleEvent>): JSX.Element => {
   const [firstRender, setFirstRender] = useState(true);
@@ -67,15 +69,15 @@ export const CalendarToolbar = (props: ToolbarProps<ScheduleEvent>): JSX.Element
   );
 };
 
+const COMPONENTS = { toolbar: CalendarToolbar };
+
 function appointmentsToEvents(appointments: Appointment[]): AppointmentEvent[] {
   return appointments
     .filter((appointment) => appointment.status !== 'cancelled' && appointment.start && appointment.end)
     .map((appointment) => {
       // Find the patient among the participants to use as title
       const patientParticipant = appointment.participant.find((p) => p.actor?.reference?.startsWith('Patient/'));
-      const status = !['booked', 'arrived', 'fulfilled'].includes(appointment.status as string)
-        ? ` (${appointment.status})`
-        : '';
+      const status = !['booked', 'arrived', 'fulfilled'].includes(appointment.status) ? ` (${appointment.status})` : '';
 
       const name = patientParticipant ? patientParticipant.actor?.display : 'No Patient';
 
@@ -126,6 +128,13 @@ function eventPropGetter(
     result.style.opacity = 0.6;
   }
 
+  // style "pending" appointments with an outlined event
+  if (event.type === 'appointment' && event.appointment.status === 'pending') {
+    result.style.border = '1px solid #228be6'; // blue.6
+    result.style.color = '#228be6'; // blue.6
+    result.style.backgroundColor = 'white';
+  }
+
   return result;
 }
 
@@ -139,7 +148,7 @@ export function Calendar(props: {
   onRangeChange?: (range: Range) => void;
 }): JSX.Element {
   const [view, setView] = useState<View>('week');
-  const [date, setDate] = useState<Date>(new Date());
+  const [date, setDate] = useState(new Date());
   const [range, setRange] = useState<Range | undefined>();
 
   const { onRangeChange } = props;
@@ -181,36 +190,63 @@ export function Calendar(props: {
     [onSelectAppointment, onSelectSlot]
   );
 
-  const events = [
-    ...appointmentsToEvents(props.appointments),
-    ...slotsToEvents(props.slots.filter((slot) => SchedulingTransientIdentifier.get(slot))),
-  ];
+  const events = useMemo(() => appointmentsToEvents(props.appointments), [props.appointments]);
 
-  const backgroundEvents = slotsToEvents(props.slots.filter((slot) => !SchedulingTransientIdentifier.get(slot)));
+  const backgroundEvents = useMemo(() => {
+    const appointmentIndex = props.appointments.reduce<Record<string, Appointment>>((acc, appointment) => {
+      (appointment.slot ?? EMPTY).forEach((slotRef) => {
+        const key = getReferenceString(slotRef);
+        if (key) {
+          acc[key] = appointment;
+        }
+      });
+      return acc;
+    }, {});
+
+    const filteredSlots = props.slots.filter((slot) => {
+      // never show "entered-in-error" slots on the calendar
+      if (slot.status === 'entered-in-error') {
+        return false;
+      }
+      const key = getReferenceString(slot);
+      if (key && appointmentIndex[key]) {
+        const appointment = appointmentIndex[key];
+        if (slot.start === appointment.start && slot.end === appointment.end) {
+          return false;
+        }
+      }
+      return true;
+    });
+    return slotsToEvents(filteredSlots);
+  }, [props.slots, props.appointments]);
+
+  const onNavigate = useCallback((newDate: Date, newView: View) => {
+    setDate(newDate);
+    setView(newView);
+  }, []);
 
   return (
-    <ReactBigCalendar
-      components={{ toolbar: CalendarToolbar }}
-      view={view}
-      date={date}
-      localizer={dayjsLocalizer(dayjs)}
-      events={events}
-      // Background events don't show in the month view
-      backgroundEvents={backgroundEvents}
-      onNavigate={(newDate: Date, newView: View) => {
-        setDate(newDate);
-        setView(newView);
-      }}
-      onRangeChange={handleRangeChange}
-      onSelectSlot={props.onSelectInterval}
-      onSelectEvent={handleSelectEvent}
-      onView={setView}
-      // Default scroll to current time
-      scrollToTime={date}
-      selectable
-      eventPropGetter={eventPropGetter}
-      style={props.style}
-      dayLayoutAlgorithm="no-overlap"
-    />
+    <div data-testid="calendar" style={{ height: '100%' }}>
+      <ReactBigCalendar
+        components={COMPONENTS}
+        view={view}
+        date={date}
+        localizer={localizer}
+        events={events}
+        // Background events don't show in the month view
+        backgroundEvents={backgroundEvents}
+        onNavigate={onNavigate}
+        onRangeChange={handleRangeChange}
+        onSelectSlot={props.onSelectInterval}
+        onSelectEvent={handleSelectEvent}
+        onView={setView}
+        // Default scroll to current time
+        scrollToTime={date}
+        selectable
+        eventPropGetter={eventPropGetter}
+        style={props.style}
+        dayLayoutAlgorithm="no-overlap"
+      />
+    </div>
   );
 }

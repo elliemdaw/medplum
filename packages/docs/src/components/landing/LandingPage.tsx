@@ -221,7 +221,7 @@ export function LandingPage(): JSX.Element {
               <TestimonialHeader
                 name="Stuart Parmenter"
                 title="Former CTO, One Medical"
-                imgSrc="/img/avatars/stuart.png"
+                imgSrc="/img/avatars/stuart.webp"
               />
               <p>
                 I've built healthcare at scale—the hard way. Skip the hidden complexity and start on Medplum's
@@ -263,7 +263,7 @@ export function LandingPage(): JSX.Element {
               <Link to="/docs" className={styles.ctaWhiteButton}>
                 See Documentation
               </Link>
-              <Link to="https://cal.com/medplum/demo?overlayCalendar=true" className={styles.purpleButton}>
+              <Link to="https://cal.com/forms/9da7bfa2-40f5-461d-ad64-33d20bd32a7a" className={styles.purpleButton}>
                 Book a Demo
               </Link>
             </div>

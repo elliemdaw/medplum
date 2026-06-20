@@ -20,7 +20,13 @@ The AI operation provides:
 Before using the `$ai` operation, you need:
 
 1. **Enable AI Feature**: The `ai` feature must be enabled on your Medplum project
-2. **OpenAI API Key**: A valid OpenAI API key (starts with `sk-`)
+2. **Configure OpenAI API Key**: Add your OpenAI API key as a project secret named `OPENAI_API_KEY` in your project settings
+
+### Using a LiteLLM Proxy (or other OpenAI-compatible endpoint)
+
+By default, the `$ai` operation calls OpenAI directly at `https://api.openai.com/v1`. To route requests through a [LiteLLM](https://docs.litellm.ai/) proxy — or any other OpenAI-compatible API — add an optional project secret named `LLM_BASE_URL` set to the base URL of the proxy (for example `https://litellm.example.com/v1`). The operation appends `/chat/completions` to this value. When `LLM_BASE_URL` is not set, the operation calls OpenAI as before.
+
+The `OPENAI_API_KEY` secret is sent as the `Authorization: Bearer` token to whichever endpoint is configured, so set it to the LiteLLM proxy's key (master key or virtual key) when using a proxy. Because LiteLLM is OpenAI-API-compatible, the request and response formats — including function calling and streaming — are unchanged, and the `model` parameter accepts any model name your proxy is configured to serve.
 
 ## Endpoint
 
@@ -35,7 +41,6 @@ POST [baseUrl]/fhir/R4/$ai
 | Name       | Type   | Required | Description                                                                                                                                          |
 | ---------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `messages` | string | Yes      | JSON string containing the conversation messages array. Each message should have `role` (`user`, `assistant`, or `system`) and `content` properties. |
-| `apiKey`   | string | Yes      | Your OpenAI API key (e.g., `sk-...`)                                                                                                                 |
 | `model`    | string | Yes      | OpenAI model to use (e.g., `gpt-4`, `gpt-3.5-turbo`, `gpt-4-turbo`)                                                                                  |
 | `tools`    | string | No       | JSON string containing the tools array for function calling (optional)                                                                               |
 
@@ -63,10 +68,6 @@ curl 'https://api.medplum.com/fhir/R4/$ai' \
       {
         "name": "messages",
         "valueString": "[{\"role\":\"user\",\"content\":\"What is FHIR?\"}]"
-      },
-      {
-        "name": "apiKey",
-        "valueString": "sk-your-api-key"
       },
       {
         "name": "model",
@@ -101,10 +102,6 @@ To maintain conversation context, include previous messages:
     {
       "name": "messages",
       "valueString": "[{\"role\":\"user\",\"content\":\"What is FHIR?\"},{\"role\":\"assistant\",\"content\":\"FHIR is a standard...\"},{\"role\":\"user\",\"content\":\"What resources does it define?\"}]"
-    },
-    {
-      "name": "apiKey",
-      "valueString": "sk-your-api-key"
     },
     {
       "name": "model",
@@ -168,10 +165,6 @@ curl 'https://api.medplum.com/fhir/R4/$ai' \
         "valueString": "[{\"role\":\"user\",\"content\":\"Find patient with phone 718-564-9483\"}]"
       },
       {
-        "name": "apiKey",
-        "valueString": "sk-your-api-key"
-      },
-      {
         "name": "model",
         "valueString": "gpt-4"
       },
@@ -212,10 +205,6 @@ curl 'https://api.medplum.com/fhir/R4/$ai' \
     {
       "name": "messages",
       "valueString": "[{\"role\":\"user\",\"content\":\"Create a task to fill up chart note\"}]"
-    },
-    {
-      "name": "apiKey",
-      "valueString": "sk-your-api-key"
     },
     {
       "name": "model",
@@ -265,10 +254,6 @@ curl 'https://api.medplum.com/fhir/R4/$ai' \
         "valueString": "[{\"role\":\"user\",\"content\":\"Explain FHIR resources\"}]"
       },
       {
-        "name": "apiKey",
-        "valueString": "sk-your-api-key"
-      },
-      {
         "name": "model",
         "valueString": "gpt-4"
       }
@@ -304,10 +289,6 @@ const response = await medplum.fhirUrl('$ai').post({
     {
       name: 'messages',
       valueString: JSON.stringify([{ role: 'user', content: 'What is FHIR?' }]),
-    },
-    {
-      name: 'apiKey',
-      valueString: 'sk-your-api-key',
     },
     {
       name: 'model',
@@ -359,10 +340,6 @@ const response = await medplum.fhirUrl('$ai').post({
       valueString: JSON.stringify([{ role: 'user', content: 'Create a patient named John Smith' }]),
     },
     {
-      name: 'apiKey',
-      valueString: 'sk-your-api-key',
-    },
-    {
       name: 'model',
       valueString: 'gpt-4',
     },
@@ -389,7 +366,7 @@ if (toolCallsParam?.valueString) {
 
 ## Security Considerations
 
-1. **API Key Management**: Never expose your OpenAI API key in client-side code. Store it securely and only pass it from server-side code.
+1. **API Key Management**: The OpenAI API key is stored as a project secret (`OPENAI_API_KEY`) and never exposed to clients. It is read server-side from project settings.
 
 2. **Feature Gating**: The AI feature must be explicitly enabled on your project. This prevents unauthorized usage.
 
@@ -404,7 +381,7 @@ if (toolCallsParam?.valueString) {
 
 ## Error Handling
 
-### Missing API Key
+### API Key Not Configured
 
 ```json
 {
@@ -414,7 +391,7 @@ if (toolCallsParam?.valueString) {
       "severity": "error",
       "code": "invalid",
       "details": {
-        "text": "Expected 1 value(s) for input parameter apiKey, but 0 provided"
+        "text": "OpenAI API key not configured in project secrets"
       }
     }
   ]
@@ -458,7 +435,7 @@ if (toolCallsParam?.valueString) {
 ## Limitations
 
 - **Streaming Mode**: Tool calls are not supported when streaming is enabled
-- **Model Support**: Only OpenAI models are currently supported
+- **Model Support**: OpenAI models, or any model exposed through an OpenAI-compatible endpoint such as a LiteLLM proxy (configured via the `LLM_BASE_URL` secret)
 - **Tool Execution**: The operation returns suggested tool calls but does not execute them automatically
 
 ## Common Use Cases
@@ -476,3 +453,4 @@ if (toolCallsParam?.valueString) {
 - [OpenAI Function Calling](https://platform.openai.com/docs/guides/function-calling)
 - [Medplum Project Features](/docs/access/projects)
 - [AI and Medplum](/docs/ai)
+- [Spaces in Medplum Provider](/docs/provider/spaces) — a worked example of `$ai` plus tool calling driving an in-app assistant

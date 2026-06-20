@@ -146,7 +146,7 @@ describe('createScimUser', () => {
     });
     user = registration.user;
     project = registration.project;
-    systemRepo = getProjectSystemRepo(project);
+    systemRepo = await getProjectSystemRepo(project);
   });
   afterAll(shutdownApp);
 
@@ -163,8 +163,9 @@ describe('createScimUser', () => {
   });
 
   test('Creating a Patient fails without a defaultPatientAccessPolicy', async () => {
+    const projectWithoutPolicy = { ...project, defaultPatientAccessPolicy: undefined };
     await expect(
-      createScimUser(createReference(user), project, {
+      createScimUser(createReference(user), projectWithoutPolicy, {
         schemas: ['urn:ietf:params:scim:schemas:core:2.0:User'],
         userType: 'Patient',
         name: {

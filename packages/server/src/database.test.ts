@@ -3,7 +3,16 @@
 import { deepClone, sleep } from '@medplum/core';
 import { EventEmitter } from 'node:events';
 import { Duplex } from 'node:stream';
-import type { Pool, PoolClient, PoolConfig, QueryArrayResult, QueryConfig, QueryResult, QueryResultRow } from 'pg';
+import type {
+  ClientBase,
+  Pool,
+  PoolClient,
+  PoolConfig,
+  QueryArrayResult,
+  QueryConfig,
+  QueryResult,
+  QueryResultRow,
+} from 'pg';
 import pg from 'pg';
 import { Readable, Writable } from 'stream';
 import { loadConfig, loadTestConfig } from './config/loader';
@@ -12,6 +21,7 @@ import {
   acquireAdvisoryLock,
   closeDatabase,
   DatabaseMode,
+  escapePgOptionsArg,
   getDatabasePool,
   getDefaultStatementTimeout,
   initDatabase,
@@ -39,7 +49,9 @@ describe('Database config', () => {
     poolSpy = jest.spyOn(pg, 'Pool').mockImplementation((_config?: PoolConfig) => {
       class MockPoolClient extends Duplex implements PoolClient {
         release(): void {}
-        async connect(): Promise<void> {}
+        async connect(): Promise<ClientBase> {
+          return this;
+        }
         async query<R extends QueryResultRow = any, I = any[]>(sql: string | QueryConfig<I>): Promise<QueryResult<R>> {
           const result: QueryResult<R> = {
             command: '',
@@ -202,7 +214,9 @@ describe('Database config', () => {
 
     // Use `jest.runAllTimersAsync().catch(...)` instead of `await jest.runAllTimersAsync()` since
     // we expect initDBPromise to reject. Based on https://github.com/jestjs/jest/issues/14120
-    jest.runAllTimersAsync().catch((reason) => console.error('Unexpected error in jest.runAllTimersAsync', reason));
+    jest
+      .runAllTimersAsync()
+      .catch((reason) => globalLogger.error('Unexpected error in jest.runAllTimersAsync', reason));
 
     await expect(initDBPromise).rejects.toThrow('Failed to acquire migration lock');
   });
@@ -240,6 +254,11 @@ describe('Database config', () => {
         options: undefined,
       })
     );
+  });
+
+  test('escapePgOptionsArg', () => {
+    expect(escapePgOptionsArg('repeatable read')).toBe('repeatable\\ read');
+    expect(escapePgOptionsArg('a\\b c')).toBe('a\\\\b\\ c');
   });
 
   test('getDefaultStatementTimeout', async () => {

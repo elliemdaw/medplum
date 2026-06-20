@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { ClientApplication, ProjectSetting } from '@medplum/fhirtypes';
+import type { ClientApplication, IdentityProvider, Project, ProjectSetting } from '@medplum/fhirtypes';
 import type { KeepJobs } from 'bullmq';
 
 export interface MedplumServerConfig {
@@ -55,6 +55,8 @@ export interface MedplumServerConfig {
   backgroundJobsRedis?: MedplumRedisConfig;
   emailProvider?: 'none' | 'awsses' | 'smtp';
   smtp?: MedplumSmtpConfig;
+  /** Allow projects to configure their own SMTP transport via Project.secret entries. Default is `true`. */
+  allowProjectSmtp?: boolean;
   bullmq?: MedplumBullmqConfig;
   googleClientId?: string;
   googleClientSecret?: string;
@@ -64,6 +66,8 @@ export interface MedplumServerConfig {
   maxBatchSize: string;
   allowedOrigins?: string;
   awsRegion: string;
+  /** Optional base64-encoded 256-bit key for S3 SSE-C (Server-Side Encryption with Customer-Provided Keys) */
+  sseCustomerKey?: string;
   botLambdaRoleArn: string;
   botLambdaLayerName: string;
   botCustomFunctionsEnabled?: boolean;
@@ -82,28 +86,22 @@ export interface MedplumServerConfig {
   accurateCountThreshold: number;
   maxSearchOffset?: number;
   base64BinaryMaxBytes?: number;
+  inlineAttachmentsMaxTotalBytes?: number;
   defaultSuperAdminEmail?: string;
   defaultSuperAdminPassword?: string;
   defaultSuperAdminClientId?: string;
   defaultSuperAdminClientSecret?: string;
   defaultBotRuntimeVersion: 'awslambda' | 'vmcontext';
-  defaultProjectFeatures?: (
-    | 'aws-comprehend'
-    | 'aws-textract'
-    | 'bots'
-    | 'cron'
-    | 'email'
-    | 'google-auth-required'
-    | 'graphql-introspection'
-    | 'websocket-subscriptions'
-    | 'transaction-bundles'
-  )[];
+  defaultProjectFeatures?: Project['features'];
   defaultProjectSystemSetting?: ProjectSetting[];
   /** Number of HTTP requests per minute users can make by default; overridable by Project settings */
   defaultRateLimit?: number;
   defaultAuthRateLimit?: number;
+  defaultLoginRateLimit?: number;
   /** Number of FHIR interaction rate limit units per minute users can consume by default; overridable by Project settings */
   defaultFhirQuota?: number;
+  /** Milliseconds of delay added per quota unit in async context, in lieu of consuming quota units. */
+  asyncDelayScaling?: number;
   /** Optional config for global default for `maxUserWebSocketSubscriptions`; overridable by Project setting: `maxUserWebSocketSubscriptions` */
   defaultMaxUserWebSocketSubscriptions?: number;
 
@@ -118,6 +116,9 @@ export interface MedplumServerConfig {
 
   /** Number of milliseconds to use as a base for exponential backoff in transaction retries */
   transactionExpBackoffBaseDelayMs?: number;
+
+  /** Optional threshold in milliseconds for logging and recording high idle time within transactions */
+  idleInTransactionLogThresholdMs?: number;
 
   /** Flag to enable/disable the binary storage auto-downloader service (default 'true' for enabled) */
   autoDownloadEnabled?: boolean;
@@ -165,10 +166,57 @@ export interface MedplumServerConfig {
   mfaAuthenticatorWindow?: number;
 
   /**
+   * Optional configuration for automatically disabling subscriptions after repeated failures.
+   * Each trigger defines a threshold: if a subscription accumulates `maxConsecutiveFailures`
+   * final failures (after all retries exhausted) within `timeWindowSeconds`, it is set to status "off".
+   * Multiple triggers are evaluated independently — the subscription is disabled if ANY trigger fires.
+   * Can be overridden per project via `Project.systemSetting[name="subscriptionAutoDisable"].valueString`.
+   */
+  subscriptionAutoDisable?: SubscriptionAutoDisableTrigger[];
+
+  /**
    * Optional configuration for background worker pools.
    * Allows running separate server pools for HTTP request serving vs. background job processing.
    */
   workers?: MedplumWorkersConfig;
+
+  /**
+   * Optional configuration for scheduled data warehouse sync jobs.
+   * Runs incremental in-server data warehouse sync jobs on a fixed cron pattern.
+   */
+  dataWarehouse?: MedplumDataWarehouseConfig;
+
+  /**
+   * Optional mTLS certificate header for incoming requests.
+   * If set, the server will attempt to extract the client certificate from the specified header.
+   * Header name should be all lowercase.
+   * For AWS ALB in "pass through" mode, this should be set to "x-amzn-mtls-clientcert".
+   * For AWS ALB in "verify" mode, this should be set to "x-amzn-mtls-clientcert-leaf".
+   */
+  mtlsCertHeader?: string;
+
+  rangeSearch?: boolean;
+
+  /**
+   * Optional URL for AI real-time transcription service.
+   * Default is `wss://api.openai.com/v1/realtime?intent=transcription`.
+   */
+  aiRealtimeTranscriptionUrl?: string;
+
+  /**
+   * Optional flag to require email verification before allowing users to create projects.
+   */
+  requireVerifiedEmailForProjectCreation?: boolean;
+
+  /** Optional flag to allow rest-hook Subscriptions to send requests to insecure HTTP URLs. */
+  allowInsecureRestHookUrl?: boolean;
+}
+
+export interface SubscriptionAutoDisableTrigger {
+  /** Number of final failures (after all retries exhausted) required to auto-disable. */
+  maxConsecutiveFailures: number;
+  /** Time window in seconds for counting failures. */
+  timeWindowSeconds: number;
 }
 
 export interface ArrayColumnPaddingConfig {
@@ -231,6 +279,8 @@ export interface MedplumSmtpConfig {
   port: number;
   username: string;
   password: string;
+  /** Use TLS when connecting. If not specified, inferred from `port === 465`. */
+  secure?: boolean;
 }
 
 export interface MedplumBullmqConfig {
@@ -239,23 +289,33 @@ export interface MedplumBullmqConfig {
    * @see {@link https://docs.bullmq.io/guide/workers/concurrency}
    */
   concurrency?: number;
+  /**
+   * Duration of the job lock in milliseconds while a worker is processing.
+   * @see {@link https://docs.bullmq.io/guide/workers/stalled-jobs}
+   */
+  lockDuration?: number;
   removeOnComplete: KeepJobs;
   removeOnFail: KeepJobs;
 }
 
 export interface MedplumExternalAuthConfig {
   readonly issuer: string;
-  readonly userInfoUrl: string;
+  /** @deprecated Use identityProvider.userInfoUrl instead. */
+  readonly userInfoUrl?: string;
+  readonly identityProvider?: IdentityProvider;
 }
 
 export type WorkerName =
+  | 'dispatch'
   | 'subscription'
   | 'download'
   | 'cron'
   | 'reindex'
   | 'batch'
   | 'post-deploy-migration'
-  | 'set-accounts';
+  | 'set-accounts'
+  | 'lambda-cleaner'
+  | 'data-warehouse-sync';
 
 export interface MedplumWorkersConfig {
   /**
@@ -270,6 +330,36 @@ export interface MedplumWorkersConfig {
    * Only takes effect for workers that are enabled.
    */
   bullmq?: Partial<Record<WorkerName, Partial<MedplumBullmqConfig>>>;
+}
+
+export type MedplumDataWarehouseDestinationType = 's3tables' | 'local';
+
+export interface MedplumDataWarehouseConfig {
+  /**
+   * Enables/disables the scheduled sync worker. Defaults to false.
+   */
+  enabled?: boolean;
+  /**
+   * BullMQ cron pattern used to schedule sync runs.
+   */
+  cron?: string;
+  /** Warehouse export destination type. */
+  destination?: MedplumDataWarehouseDestinationType;
+  /** Required when destination is `s3tables`. */
+  awsS3TableArn?: string;
+  /** Required when destination is `local`. */
+  localBasePath?: string;
+  /** Optional Iceberg namespace used by sync. */
+  namespace?: string;
+  /**
+   * Earliest resource `lastUpdated` timestamp to include in sync (ISO-8601 date or date-time string).
+   * History rows with `lastUpdated` before this value are excluded.
+   */
+  startDate?: string;
+  /** FHIR resource types to include (e.g. `Patient`, `Observation`). When omitted, all types are candidates. */
+  includeResourceTypes?: string[];
+  /** FHIR resource types to exclude from sync. Cannot be set together with `includeResourceTypes`. */
+  excludeResourceTypes?: string[];
 }
 
 export interface MedplumFissionConfig {

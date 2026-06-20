@@ -22,7 +22,7 @@ import { authenticator } from 'otplib';
 import { resetPassword } from '../auth/resetpassword';
 import { bcryptHashPassword, createProjectMembership } from '../auth/utils';
 import { getConfig } from '../config/loader';
-import { getAuthenticatedContext } from '../context';
+import { getAuthenticatedContext, tryGetRequestContext } from '../context';
 import { sendEmail } from '../email/email';
 import type { SystemRepository } from '../fhir/repo';
 import { getProjectSystemRepo } from '../fhir/repo';
@@ -70,7 +70,7 @@ export interface ServerInviteResponse {
 }
 
 export async function inviteUser(request: ServerInviteRequest): Promise<ServerInviteResponse> {
-  const systemRepo = getProjectSystemRepo(request.project);
+  const systemRepo = await getProjectSystemRepo(request.project);
   const logger = getLogger();
 
   if (request.email) {
@@ -86,7 +86,7 @@ export async function inviteUser(request: ServerInviteRequest): Promise<ServerIn
   let user: WithId<User>;
   if (email) {
     const { resource: result, outcome } = await systemRepo.withTransaction(
-      async () => {
+      async (txRepo) => {
         // If inviting with an email address, check for existing memberships
         // tied to this project/email combination that are at a different scope
         // than the one we would create. This avoids confusion of someone
@@ -98,7 +98,7 @@ export async function inviteUser(request: ServerInviteRequest): Promise<ServerIn
             ? { code: 'user:User.project', operator: Operator.MISSING, value: 'true' }
             : { code: 'user:User.project', operator: Operator.EXACT, value: `Project/${project.id}` };
 
-          const existingMemberships = await systemRepo.searchResources<ProjectMembership>({
+          const existingMemberships = await txRepo.searchResources<ProjectMembership>({
             resourceType: 'ProjectMembership',
             filters: [
               { code: 'user:User.email', operator: Operator.EXACT, value: email },
@@ -120,13 +120,13 @@ export async function inviteUser(request: ServerInviteRequest): Promise<ServerIn
               operator: Operator.EXACT,
               value: email,
             },
-            request.resourceType === 'Patient' || request.scope === 'project'
+            userResource.project
               ? { code: 'project', operator: Operator.EQUALS, value: `Project/${project.id}` }
               : { code: 'project', operator: Operator.MISSING, value: 'true' },
           ],
         };
 
-        return systemRepo.conditionalCreate(userResource, searchRequest);
+        return txRepo.conditionalCreate(userResource, searchRequest);
       },
       { serializable: true }
     );
@@ -160,12 +160,11 @@ async function makeUserResource(request: ServerInviteRequest): Promise<User> {
   const password = request.password ?? generateSecret(16);
   const passwordHash = await bcryptHashPassword(password);
 
+  // Default scoping: Patients are project-scoped, Practitioners/RelatedPersons are server-scoped.
+  // Either default can be overridden with scope: 'project' | 'server'.
+  // Users with an externalId are always project-scoped regardless of resourceType.
   let project: Reference<Project> | undefined = undefined;
-  if (request.resourceType === 'Patient' || externalId || scope === 'project') {
-    // Users can optionally be scoped to a project.
-    // We force users to be scoped to a project if:
-    // 1) They are a patient
-    // 2) They are a practitioner with an externalId
+  if ((request.resourceType === 'Patient' && scope !== 'server') || externalId || scope === 'project') {
     project = createReference(request.project);
   }
 
@@ -217,7 +216,7 @@ async function upsertProfileResource(
     } as ProfileResource;
 
     if (email) {
-      const { resource: result, outcome } = await systemRepo.conditionalCreate<ProfileResource>(resource, {
+      const { resource: result, outcome } = await systemRepo.conditionalCreate(resource, {
         resourceType,
         filters: [
           {
@@ -334,8 +333,20 @@ async function upsertProjectMembership(
     accessPolicy: request.accessPolicy,
     access: request.access,
     admin: request.admin,
+    invitedBy: tryGetRequestContext()?.authState?.membership?.user,
     ...request.membership,
   };
+
+  // Patients only. RelatedPerson and Practitioner invites are unchanged.
+  // Also applies on upsert when no policy is provided in the request.
+  if (
+    request.resourceType === 'Patient' &&
+    !partialMembership.accessPolicy &&
+    !partialMembership.access?.length &&
+    project.defaultPatientAccessPolicy
+  ) {
+    partialMembership.accessPolicy = project.defaultPatientAccessPolicy;
+  }
 
   if (request.forceNewMembership) {
     return createProjectMembership(systemRepo, user, project, profile, partialMembership);
@@ -343,8 +354,8 @@ async function upsertProjectMembership(
 
   // Upsert ProjectMembership resource to connect User to profile resource in the given Project
   const membership = await systemRepo.withTransaction(
-    async () => {
-      const existingMembership = await searchForExistingMembership(systemRepo, user, project);
+    async (txRepo) => {
+      const existingMembership = await searchForExistingMembership(txRepo, user, project);
       if (existingMembership) {
         if (!request.upsert) {
           throw new OperationOutcomeError(conflict('User is already a member of this project'));
@@ -358,7 +369,7 @@ async function upsertProjectMembership(
 
         // Update the existing membership
         // Be careful to preserve the critical properties: id, project, user, and profile
-        return systemRepo.updateResource<ProjectMembership>({
+        return txRepo.updateResource<ProjectMembership>({
           ...existingMembership,
           ...partialMembership,
           resourceType: 'ProjectMembership',
@@ -368,7 +379,7 @@ async function upsertProjectMembership(
           profile: createReference(profile),
         });
       } else {
-        return createProjectMembership(systemRepo, user, project, profile, partialMembership);
+        return createProjectMembership(txRepo, user, project, profile, partialMembership);
       }
     },
     { serializable: true }
@@ -437,7 +448,7 @@ async function sendInviteEmail(
     ].join('\n');
   }
   try {
-    await sendEmail(systemRepo, options);
+    await sendEmail(systemRepo, options, request.project);
   } catch (err) {
     // A common error for new self-hosted Medplum servers is that SES is not configured.
     // A long time ago, we made the mistake of establishing a convention of HTTP 200 + OperationOutcome for this case.

@@ -9,8 +9,10 @@ import type {
   ObservationDefinition,
   Patient,
   Resource,
+  Slot,
   User,
 } from '@medplum/fhirtypes';
+import { vi } from 'vitest';
 import { ContentType } from './contenttype';
 import { OperationOutcomeError } from './outcomes';
 import { PropertyType } from './types';
@@ -22,6 +24,8 @@ import {
   calculateAge,
   calculateAgeString,
   capitalize,
+  codeableConceptMatchesToken,
+  codingMatchesToken,
   concatUrls,
   createReference,
   deepClone,
@@ -57,6 +61,7 @@ import {
   isValidHostname,
   lazy,
   mapByIdentifier,
+  NOOP,
   parseReference,
   preciseEquals,
   preciseGreaterThan,
@@ -216,6 +221,40 @@ describe('Core Utils', () => {
       })
     ).toStrictEqual('foo');
     expect(getDisplayString({ resourceType: 'PractitionerRole', code: [{ text: 'foo' }] })).toStrictEqual('foo');
+    expect(
+      getDisplayString({
+        resourceType: 'Appointment',
+        status: 'booked',
+        participant: [{ status: 'accepted' }],
+        serviceType: [{ text: 'Consultation' }],
+      })
+    ).toStrictEqual('Consultation');
+    expect(
+      getDisplayString({
+        resourceType: 'Appointment',
+        id: '123',
+        status: 'booked',
+        participant: [{ status: 'accepted' }],
+      })
+    ).toStrictEqual('Appointment/123');
+    expect(
+      getDisplayString({
+        resourceType: 'Slot',
+        id: '123',
+        status: 'free',
+        schedule: { reference: 'Schedule/123' },
+        start: '2021-06-01T12:00:00Z',
+        end: '2021-06-01T13:00:00Z',
+      })
+    ).toMatch(/2021.* - .*2021/);
+    expect(
+      getDisplayString({
+        resourceType: 'Slot',
+        id: '123',
+        status: 'free',
+        schedule: { reference: 'Schedule/123' },
+      } as Slot)
+    ).toStrictEqual('Slot/123');
     expect(
       getDisplayString({
         resourceType: 'Subscription',
@@ -878,6 +917,51 @@ describe('Core Utils', () => {
     expect(findCodeBySystem(categories, 'z')).toStrictEqual(undefined);
   });
 
+  test('codingMatchesToken', () => {
+    expect(codingMatchesToken({ code: 'hello' }, 'hello')).toStrictEqual(true);
+    expect(codingMatchesToken({ system: 'https://example.com/fhir', code: 'hello' }, 'hello')).toStrictEqual(true);
+
+    expect(codingMatchesToken({ code: 'hello' }, 'world')).toStrictEqual(false);
+    expect(codingMatchesToken({ system: 'https://example.com/fhir', code: 'hello' }, 'world')).toStrictEqual(false);
+
+    expect(codingMatchesToken({ code: 'hello' }, '|hello')).toStrictEqual(true);
+    expect(codingMatchesToken({ system: 'https://example.com/fhir', code: 'hello' }, '|hello')).toStrictEqual(false);
+
+    expect(codingMatchesToken({ code: 'hello' }, 'https://example.com/fhir|')).toStrictEqual(false);
+    expect(
+      codingMatchesToken({ system: 'https://example.com/fhir', code: 'hello' }, 'https://example.com/fhir|')
+    ).toStrictEqual(true);
+
+    expect(codingMatchesToken({ code: 'hello' }, 'https://example.com/fhir|hello')).toStrictEqual(false);
+    expect(
+      codingMatchesToken({ system: 'https://example.com/fhir', code: 'hello' }, 'https://example.com/fhir|hello')
+    ).toStrictEqual(true);
+  });
+
+  test('codeableConceptMatchesToken', () => {
+    // true when there is one coding that matches
+    expect(codeableConceptMatchesToken({ coding: [{ code: 'hello' }] }, 'hello')).toEqual(true);
+
+    // returns true when there are multiple codings and at least one matches
+    expect(codeableConceptMatchesToken({ coding: [{ code: 'different' }, { code: 'hello' }] }, 'hello')).toEqual(true);
+
+    // returns false when no coding matches
+    expect(
+      codeableConceptMatchesToken(
+        {
+          coding: [
+            { code: 'different' },
+            { code: 'hello' }, // not a match: no `system` component
+          ],
+        },
+        'https://example.com/fhir|hello'
+      )
+    ).toEqual(false);
+
+    // returns false when the concept has no codings
+    expect(codeableConceptMatchesToken({}, 'hello')).toEqual(false);
+  });
+
   test('Capitalize', () => {
     expect(capitalize('id')).toStrictEqual('Id');
     expect(capitalize('Id')).toStrictEqual('Id');
@@ -1355,7 +1439,7 @@ describe('Core Utils', () => {
 
     controller.abort();
 
-    await expect(promise).rejects.toThrow('The operation was aborted');
+    await expect(promise).rejects.toThrow('This operation was aborted');
   });
 
   test('splitN', () => {
@@ -1371,7 +1455,7 @@ describe('Core Utils', () => {
   });
 
   test('lazy', () => {
-    const mockFn = jest.fn().mockReturnValue('test result');
+    const mockFn = vi.fn().mockReturnValue('test result');
     const lazyFn = lazy(mockFn);
 
     // the mock function should not have been called
@@ -1564,6 +1648,10 @@ describe('Core Utils', () => {
     expect(isValidHostname('https://foo.com')).toStrictEqual(false);
     expect(isValidHostname('foo_-bar_-')).toStrictEqual(false);
     expect(isValidHostname('foo | rm -rf /')).toStrictEqual(false);
+  });
+
+  test('NOOP', () => {
+    expect(NOOP()).toBeUndefined();
   });
 });
 

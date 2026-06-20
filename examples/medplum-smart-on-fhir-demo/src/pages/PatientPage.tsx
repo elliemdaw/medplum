@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Anchor, Badge, Container, Divider, Group, Loader, Paper, Stack, Table, Text, Title } from '@mantine/core';
 import { calculateAgeString, formatDate, formatHumanName } from '@medplum/core';
-import type { Bundle, Condition, HumanName, Observation, Patient } from '@medplum/fhirtypes';
+import type { Bundle, Condition, Observation, Patient } from '@medplum/fhirtypes';
 import { ResourceAvatar, useMedplum } from '@medplum/react';
 import { IconArrowLeft } from '@tabler/icons-react';
 import type { ChartData } from 'chart.js';
@@ -33,13 +33,13 @@ export function PatientPage(): JSX.Element {
   const medplum = useMedplum();
   const navigate = useNavigate();
   const [patient, setPatient] = useState<Patient>();
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [bpReadings, setBpReadings] = useState<Observation[]>([]);
   const [conditions, setConditions] = useState<Condition[]>([]);
   const [latestWeight, setLatestWeight] = useState<Observation>();
   const [latestBmi, setLatestBmi] = useState<Observation>();
-  const [isMedplumFlow, setIsMedplumFlow] = useState<boolean>(false);
+  const [isMedplumFlow, setIsMedplumFlow] = useState(false);
 
   useEffect(() => {
     const fetchData = async (): Promise<void> => {
@@ -235,7 +235,7 @@ export function PatientPage(): JSX.Element {
   const bmiValue = latestBmi?.valueQuantity?.value;
   const bmiUnit = latestBmi?.valueQuantity?.unit ?? 'kg/m²';
 
-  const patientName = formatHumanName(patient.name?.[0] as HumanName);
+  const patientName = formatHumanName(patient.name?.[0]);
   const gender = patient.gender ? patient.gender.charAt(0).toUpperCase() + patient.gender.slice(1) : undefined;
 
   return (

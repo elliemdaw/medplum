@@ -157,7 +157,9 @@ describe('Project Admin routes', () => {
       })
     );
 
-    const bobRegistration = await addTestUser(aliceRegistration.project, { resourceType: 'AccessPolicy' });
+    const bobRegistration = await addTestUser(aliceRegistration.project, {
+      accessPolicy: { resourceType: 'AccessPolicy' },
+    });
 
     // Try to access Alice's project using Alices's access token
     // Should succeed
@@ -289,6 +291,21 @@ describe('Project Admin routes', () => {
       ]);
 
     expect(res14.status).toBe(403);
+
+    // Try to update settings using Bob's access token
+    // Should fail
+    const res15 = await request(app)
+      .post('/admin/projects/' + aliceRegistration.project.id + '/settings')
+      .set('Authorization', 'Bearer ' + bobRegistration.accessToken)
+      .type('json')
+      .send([
+        {
+          name: 'test_setting',
+          valueString: 'test_value',
+        },
+      ]);
+
+    expect(res15.status).toBe(403);
   });
 
   test('Delete membership', async () => {
@@ -577,10 +594,48 @@ describe('Project Admin routes', () => {
     expect(res3.body.project.site[0].name).toStrictEqual('test_site');
   });
 
+  test('Save project settings', async () => {
+    // Register and create a project
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'John',
+        lastName: 'Adams',
+        projectName: 'Adams Project',
+        email: `john${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    // Add a setting
+    const res2 = await request(app)
+      .post('/admin/projects/' + project.id + '/settings')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send([
+        {
+          name: 'aiModels',
+          valueString: JSON.stringify([{ value: 'gpt-5.5', label: 'GPT-5.5' }]),
+        },
+      ]);
+    expect(res2.status).toBe(200);
+
+    // Verify the setting was added
+    const res3 = await request(app)
+      .get('/admin/projects/' + project.id)
+      .set('Authorization', 'Bearer ' + accessToken);
+    expect(res3.status).toBe(200);
+    expect(res3.body.project.setting).toHaveLength(1);
+    expect(res3.body.project.setting[0].name).toStrictEqual('aiModels');
+    expect(res3.body.project.setting[0].valueString).toStrictEqual(
+      JSON.stringify([{ value: 'gpt-5.5', label: 'GPT-5.5' }])
+    );
+  });
+
   test('Set password access denied', async () => {
     // Create test user in project
     const testProjectUser = await addTestUser(testProjectAdmin.project, {
-      resourceType: 'AccessPolicy',
+      accessPolicy: {
+        resourceType: 'AccessPolicy',
+      },
     });
 
     // Try to set password using user's access token
@@ -682,5 +737,167 @@ describe('Project Admin routes', () => {
       });
 
     expect(res.status).toBe(200);
+  });
+
+  test('Reset MFA - success', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Carol',
+        lastName: 'King',
+        projectName: 'Carol Project',
+        email: `carol${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    // Invite a member
+    const inviteRes = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Dave',
+        lastName: 'Lee',
+        email: `dave${randomUUID()}@example.com`,
+      });
+    expect(inviteRes.status).toBe(200);
+
+    // inviteRes.body is the ProjectMembership resource directly
+    const membershipId = inviteRes.body.id as string;
+    const userId = (inviteRes.body.user.reference as string).split('/')[1];
+
+    // Manually mark the user as MFA enrolled via systemRepo (bypassing access policy)
+    const systemRepo = getGlobalSystemRepo();
+    const invitedUser = await withTestContext(() => systemRepo.readResource<User>('User', userId));
+    await withTestContext(() =>
+      systemRepo.updateResource<User>({
+        ...invitedUser,
+        mfaEnrolled: true,
+        mfaSecret: 'TESTSECRET',
+      })
+    );
+
+    // Admin resets MFA
+    const resetRes = await request(app)
+      .post(`/admin/projects/${project.id}/members/${membershipId}/mfa/reset`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send();
+    expect(resetRes.status).toBe(200);
+
+    // Verify user is no longer enrolled
+    const updatedUser = await withTestContext(() => systemRepo.readResource<User>('User', userId));
+    expect(updatedUser.mfaEnrolled).toBe(false);
+    // Secret should have been rotated
+    expect(updatedUser.mfaSecret).not.toBe('TESTSECRET');
+  });
+
+  test('Reset MFA - user not enrolled', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Eve',
+        lastName: 'Adams',
+        projectName: 'Eve Project',
+        email: `eve${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const inviteRes = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Frank',
+        lastName: 'Mills',
+        email: `frank${randomUUID()}@example.com`,
+      });
+    expect(inviteRes.status).toBe(200);
+
+    const membershipId = inviteRes.body.id as string;
+
+    const resetRes = await request(app)
+      .post(`/admin/projects/${project.id}/members/${membershipId}/mfa/reset`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send();
+    expect(resetRes.status).toBe(400);
+    expect(resetRes.body.issue[0].details.text).toBe('User is not enrolled in MFA');
+  });
+
+  test('Reset MFA - membership from different project is rejected', async () => {
+    const { project: projectA, accessToken: tokenA } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Grace',
+        lastName: 'Hopper',
+        projectName: 'Project A',
+        email: `grace${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const { project: projectB, accessToken: tokenB } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Hank',
+        lastName: 'Hill',
+        projectName: 'Project B',
+        email: `hank${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    // Invite a member to Project B
+    const inviteRes = await request(app)
+      .post('/admin/projects/' + projectB.id + '/invite')
+      .set('Authorization', 'Bearer ' + tokenB)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Ivy',
+        lastName: 'Chen',
+        email: `ivy${randomUUID()}@example.com`,
+      });
+    expect(inviteRes.status).toBe(200);
+
+    const membershipId = inviteRes.body.id as string;
+
+    // Project A admin tries to reset MFA for Project B member.
+    // ctx.repo is scoped to Project A so the membership is not visible → 404.
+    const resetRes = await request(app)
+      .post(`/admin/projects/${projectA.id}/members/${membershipId}/mfa/reset`)
+      .set('Authorization', 'Bearer ' + tokenA)
+      .send();
+    expect(resetRes.status).toBe(404);
+  });
+
+  test('Reset MFA - non-admin is rejected', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Jack',
+        lastName: 'Black',
+        projectName: 'Jack Project',
+        email: `jack${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const inviteRes = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Karen',
+        lastName: 'Page',
+        email: `karen${randomUUID()}@example.com`,
+      });
+    expect(inviteRes.status).toBe(200);
+
+    const membershipId = inviteRes.body.id as string;
+
+    // Add a non-admin member to the same project and use their token
+    const nonAdminUser = await withTestContext(() => addTestUser(project));
+
+    const resetRes = await request(app)
+      .post(`/admin/projects/${project.id}/members/${membershipId}/mfa/reset`)
+      .set('Authorization', 'Bearer ' + nonAdminUser.accessToken)
+      .send();
+    expect(resetRes.status).toBe(403);
   });
 });

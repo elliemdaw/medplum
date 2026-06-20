@@ -14,7 +14,7 @@ import { inviteUser } from '../admin/invite';
 import { initApp, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
 import type { Repository } from '../fhir/repo';
-import { getProjectSystemRepo } from '../fhir/repo';
+import { getGlobalSystemRepo, getProjectSystemRepo } from '../fhir/repo';
 import { createTestProject, setupPwnedPasswordMock, setupRecaptchaMock, withTestContext } from '../test.setup';
 import { registerNew } from './register';
 import { setPassword } from './setpassword';
@@ -34,6 +34,8 @@ let corsClient: WithId<ClientApplication>;
 describe('Login', () => {
   beforeAll(async () => {
     const config = await loadTestConfig();
+    const systemRepo = getGlobalSystemRepo();
+
     await withTestContext(async () => {
       config.emailProvider = 'awsses';
       await initApp(app, config);
@@ -63,7 +65,7 @@ describe('Login', () => {
       });
 
       // Set the test user password
-      await setPassword(user, password);
+      await setPassword(systemRepo, user, password);
     });
   });
 
@@ -288,7 +290,7 @@ describe('Login', () => {
     const res8 = await request(app).post('/auth/login').type('json').send({
       email: memberEmail,
       password: 'my-new-password',
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
@@ -303,7 +305,7 @@ describe('Login', () => {
     });
     expect(res9.status).toBe(200);
     expect(res9.body.token_type).toBe('Bearer');
-    expect(res9.body.scope).toBe('openid offline');
+    expect(res9.body.scope).toBe('openid offline_access');
     expect(res9.body.expires_in).toBe(3600);
     expect(res9.body.id_token).toBeDefined();
     expect(res9.body.access_token).toBeDefined();
@@ -353,7 +355,7 @@ describe('Login', () => {
 
     // Register and create a project
     await withTestContext(async () => {
-      const { project } = await registerNew({
+      const { project: newProject } = await registerNew({
         firstName: 'Google',
         lastName: 'Google',
         projectName: 'Require Google Auth',
@@ -362,9 +364,9 @@ describe('Login', () => {
       });
 
       // As a super admin, update the project to require Google auth
-      const systemRepo = getProjectSystemRepo(project);
+      const systemRepo = await getProjectSystemRepo(newProject);
       await systemRepo.updateResource({
-        ...project,
+        ...newProject,
         features: ['google-auth-required'],
       });
     });
@@ -374,7 +376,7 @@ describe('Login', () => {
     const res8 = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
     });
     expect(res8.status).toBe(400);
     expect(res8.body).toMatchObject({
@@ -417,7 +419,7 @@ describe('Login', () => {
     const res1 = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
@@ -431,7 +433,7 @@ describe('Login', () => {
       resourceType: 'Practitioner',
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
@@ -444,7 +446,7 @@ describe('Login', () => {
       resourceType: 'Patient',
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
@@ -473,7 +475,7 @@ describe('Login', () => {
     const res1 = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
@@ -485,7 +487,7 @@ describe('Login', () => {
     const res2 = await request(app).post('/auth/login').type('json').send({
       email: email.toLowerCase(),
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
@@ -532,7 +534,7 @@ describe('Login', () => {
     const res = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
       projectId: project.id,
@@ -541,7 +543,7 @@ describe('Login', () => {
     expect(res.body.login).toBeUndefined();
     expect(res.body.code).toBeUndefined();
     expect(res.body.memberships).toBeUndefined();
-    expect(res.body.issue[0].details.text).toBe('Profile not active');
+    expect(res.body.issue[0].details.text).toBe('User not found');
   });
 
   test('Success with no origin', async () => {

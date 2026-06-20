@@ -356,6 +356,7 @@ export interface ProcessMessageParams {
   setCurrentFhirRequest: (request: string | undefined) => void;
   onNewTopic: (topic: Communication) => void;
   onStreamChunk?: (chunk: string) => void;
+  onComponentStart?: () => void;
   onComponentStreamChunk?: (chunk: string) => void;
 }
 
@@ -379,6 +380,7 @@ export async function processMessage(params: ProcessMessageParams): Promise<Proc
     setCurrentFhirRequest,
     onNewTopic,
     onStreamChunk,
+    onComponentStart,
     onComponentStreamChunk,
   } = params;
 
@@ -397,31 +399,42 @@ export async function processMessage(params: ProcessMessageParams): Promise<Proc
     await saveMessage(medplum, activeTopicId, userMessage, currentMessages.length - 1);
   }
 
-  // Get initial bot response
-  const initialResponse = await sendToBot(medplum, fhirRequestToolsId, currentMessages, selectedModel);
+  const MAX_AGENT_ITERATIONS = 10;
   const allResourceRefs: string[] = [];
-  let content = initialResponse.content;
+  let visualize = false;
+  let content: string | undefined;
+  let loopCompleted = false;
 
-  // Process tool calls if present
-  if (initialResponse.toolCalls) {
+  for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
+    const translatorResponse = await sendToBot(medplum, fhirRequestToolsId, currentMessages, selectedModel);
+
+    // No tool calls = bot is done, has final answer
+    if (!translatorResponse.toolCalls || translatorResponse.toolCalls.length === 0) {
+      content = translatorResponse.content;
+      loopCompleted = true;
+      break;
+    }
+
+    if (translatorResponse.visualize) {
+      visualize = true;
+    }
+
     const assistantMessageWithToolCalls: Message = {
       role: 'assistant',
       content: null,
-      tool_calls: initialResponse.toolCalls,
+      tool_calls: translatorResponse.toolCalls,
     };
     currentMessages.push(assistantMessageWithToolCalls);
 
-    // Execute all tool calls first (don't save yet)
     const { messages: toolMessages, resourceRefs } = await executeToolCalls(
       medplum,
-      initialResponse.toolCalls,
-      setCurrentFhirRequest
+      translatorResponse.toolCalls,
+      (request) => setCurrentFhirRequest(`Step ${iteration + 1}: ${request}`)
     );
     currentMessages.push(...toolMessages);
     allResourceRefs.push(...resourceRefs);
 
-    // Save tool responses before the assistant message so a failed save never leaves
-    // an assistant+tool_calls record without corresponding responses in the DB.
+    // Persist per-iteration (keeps DB recoverable if mid-loop failure)
     if (activeTopicId) {
       const baseSequence = currentMessages.length - 1 - toolMessages.length;
       for (let i = 0; i < toolMessages.length; i++) {
@@ -430,47 +443,12 @@ export async function processMessage(params: ProcessMessageParams): Promise<Proc
       await saveMessage(medplum, activeTopicId, assistantMessageWithToolCalls, baseSequence);
     }
 
-    if (initialResponse.visualize && allResourceRefs.length > 0) {
-      const fhirData = await collectFhirData(medplum, allResourceRefs);
+    // Reset FHIR indicator while bot thinks about next step
+    setCurrentFhirRequest(undefined);
+  }
 
-      let componentCode: string | undefined;
-      const componentChunkCallback = onComponentStreamChunk ?? onStreamChunk;
-      if (componentChunkCallback) {
-        const result = await sendToBotStreaming(
-          medplum,
-          componentGeneratorBotSseId,
-          currentMessages,
-          selectedModel,
-          componentChunkCallback,
-          [{ name: 'fhirData', valueString: JSON.stringify(fhirData) }]
-        );
-        content = result.content;
-        componentCode = result.code;
-      } else {
-        const componentResponse = await sendToBot(medplum, componentGeneratorBotSseId, currentMessages, selectedModel);
-        content = componentResponse.content;
-      }
-
-      const uniqueRefs = [...new Set(allResourceRefs)];
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: content || 'I received your message but was unable to generate a response. Please try again.',
-        resources: uniqueRefs,
-        componentCode,
-      };
-
-      if (activeTopicId) {
-        await saveMessage(medplum, activeTopicId, assistantMessage, currentMessages.length);
-      }
-
-      return {
-        activeTopicId,
-        assistantMessage,
-        updatedMessages: [...currentMessages, assistantMessage],
-      };
-    }
-
-    // Get summary response after tool execution (streaming if callback provided)
+  // Get summary response after tool execution (streaming if callback provided)
+  if (currentMessages.some((m) => m.role === 'tool')) {
     if (onStreamChunk) {
       const result = await sendToBotStreaming(
         medplum,
@@ -486,11 +464,44 @@ export async function processMessage(params: ProcessMessageParams): Promise<Proc
     }
   }
 
+  if (!loopCompleted && content) {
+    content +=
+      '\n\n_Note: The request reached the processing limit before fully completing. Try a more specific question or break it into smaller parts._';
+  } else if (!loopCompleted) {
+    content =
+      'The request reached the processing limit before any results could be gathered. Try a more specific question or break it into smaller parts.';
+  }
+
+  let componentCode: string | undefined;
+  if (visualize && allResourceRefs.length > 0) {
+    // Signal that component generation has begun so the UI can show feedback
+    // while we fetch FHIR data and wait for the bot's first streamed chunk.
+    onComponentStart?.();
+
+    const fhirData = await collectFhirData(medplum, allResourceRefs);
+
+    const componentChunkCallback = onComponentStreamChunk ?? onStreamChunk;
+    if (componentChunkCallback) {
+      const result = await sendToBotStreaming(
+        medplum,
+        componentGeneratorBotSseId,
+        currentMessages,
+        selectedModel,
+        componentChunkCallback,
+        [{ name: 'fhirData', valueString: JSON.stringify(fhirData) }]
+      );
+      componentCode = result.code;
+    } else {
+      await sendToBot(medplum, componentGeneratorBotSseId, currentMessages, selectedModel);
+    }
+  }
+
   const uniqueRefs = allResourceRefs.length > 0 ? [...new Set(allResourceRefs)] : undefined;
   const assistantMessage: Message = {
     role: 'assistant',
     content: content || 'I received your message but was unable to generate a response. Please try again.',
     resources: uniqueRefs,
+    componentCode,
   };
 
   if (activeTopicId) {

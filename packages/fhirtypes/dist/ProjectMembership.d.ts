@@ -121,7 +121,7 @@ export interface ProjectMembership {
   /**
    * The project administrator who invited the user to the project.
    */
-  invitedBy?: Reference<User>;
+  invitedBy?: Reference<Bot | ClientApplication | User>;
 
   /**
    * User that is granted access to the project.
@@ -163,7 +163,7 @@ export interface ProjectMembership {
   externalId?: string;
 
   /**
-   * The access policy for the user within the project memebership.
+   * The access policy for the user within the project membership.
    */
   accessPolicy?: Reference<AccessPolicy>;
 
@@ -173,7 +173,7 @@ export interface ProjectMembership {
   access?: ProjectMembershipAccess[];
 
   /**
-   * The user configuration for the user within the project memebership
+   * The user configuration for the user within the project membership
    * such as menu links, saved searches, and features.
    */
   userConfiguration?: Reference<UserConfiguration>;

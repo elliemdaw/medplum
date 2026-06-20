@@ -144,7 +144,7 @@ async function buildStackDetails(
 
   if (client === cloudFormationClient) {
     result.stack = stack;
-    result.tag = medplumTag.Value as string;
+    result.tag = medplumTag.Value;
   }
 
   for (const resource of stackResources.StackResources) {
@@ -270,12 +270,12 @@ export async function getServerVersions(from?: string): Promise<string[]> {
 export async function writeParameters(
   region: string,
   prefix: string,
-  params: Record<string, string | number>
+  params: Record<string, string | number | boolean | object>
 ): Promise<void> {
   const client = new SSMClient({ region });
   for (const [key, value] of Object.entries(params)) {
     const name = prefix + key;
-    const valueStr = value.toString();
+    const valueStr = typeof value === 'object' ? JSON.stringify(value) : value.toString();
     const existingValue = await readParameter(client, name);
 
     if (existingValue !== undefined && existingValue !== valueStr) {

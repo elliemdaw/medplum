@@ -6,7 +6,7 @@ import { DrAliceSmith, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { UserEvent } from '@testing-library/user-event';
 import userEvent from '@testing-library/user-event';
-import { render, screen, waitFor } from '../../test-utils/render';
+import { act, render, screen, waitFor } from '../../test-utils/render';
 import { ParticipantFilter } from './ParticipantFilter';
 
 const mockPractitioner: Practitioner = {
@@ -21,11 +21,19 @@ const mockPatient: Patient = {
   name: [{ given: ['Jane'], family: 'Smith' }],
 };
 
-const mockOnFilterChange = jest.fn();
+const mockOnFilterChange = vi.fn();
 
 describe('ParticipantFilter', () => {
   beforeEach(async () => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    await act(async () => {
+      vi.runOnlyPendingTimers();
+    });
+    vi.useRealTimers();
   });
 
   const setup = async (
@@ -39,7 +47,7 @@ describe('ParticipantFilter', () => {
     await medplum.updateResource(mockPractitioner as WithId<Practitioner>);
     await medplum.updateResource(mockPatient as WithId<Patient>);
 
-    const user = userEvent.setup();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     render(
       <ParticipantFilter selectedParticipants={selectedParticipants} onFilterChange={mockOnFilterChange} />,
       ({ children }) => <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
@@ -96,7 +104,11 @@ describe('ParticipantFilter', () => {
     const button = screen.getByRole('button');
     await user.click(button);
 
-    const checkboxes = await screen.findAllByRole('checkbox');
+    await waitFor(() => {
+      expect(screen.getByText('Message Participants')).toBeInTheDocument();
+    });
+
+    const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
     expect(checkboxes[0]).not.toBeChecked();
   });
 
@@ -106,7 +118,11 @@ describe('ParticipantFilter', () => {
     const button = screen.getByRole('button');
     await user.click(button);
 
-    const checkboxes = await screen.findAllByRole('checkbox');
+    await waitFor(() => {
+      expect(screen.getByText('Message Participants')).toBeInTheDocument();
+    });
+
+    const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
     expect(checkboxes[0]).toBeChecked();
   });
 
@@ -175,7 +191,7 @@ describe('ParticipantFilter', () => {
 
   test('searches for participants when typing in search input', async () => {
     const medplum = new MockClient();
-    const searchSpy = jest.spyOn(medplum, 'search').mockResolvedValue({
+    const searchSpy = vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockPatient as WithId<Patient> }],
@@ -203,7 +219,7 @@ describe('ParticipantFilter', () => {
 
   test('displays search results', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockPatient as WithId<Patient> }],
@@ -227,7 +243,7 @@ describe('ParticipantFilter', () => {
 
   test('filters out current user from search results', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockPractitioner as WithId<Practitioner> }],
@@ -252,7 +268,7 @@ describe('ParticipantFilter', () => {
 
   test('shows "No results found" when search returns empty', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [],
@@ -276,7 +292,7 @@ describe('ParticipantFilter', () => {
 
   test('clears search input when clear button is clicked', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockPatient as WithId<Patient> }],
@@ -306,7 +322,7 @@ describe('ParticipantFilter', () => {
 
   test('selecting a search result calls onFilterChange', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockPatient as WithId<Patient> }],
@@ -355,7 +371,11 @@ describe('ParticipantFilter', () => {
     const button = screen.getByRole('button');
     await user.click(button);
 
-    const checkboxes = await screen.findAllByRole('checkbox');
+    await waitFor(() => {
+      expect(screen.getByText('Message Participants')).toBeInTheDocument();
+    });
+
+    const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
     expect(checkboxes[0]).toBeChecked();
     expect(checkboxes[1]).toBeChecked();
   });
@@ -380,7 +400,7 @@ describe('ParticipantFilter', () => {
 
   test('clears search when clear button is clicked', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockPatient as WithId<Patient> }],
@@ -430,7 +450,7 @@ describe('ParticipantFilter', () => {
 
   test('handles no profile (logged out state)', async () => {
     const medplum = new MockClient();
-    medplum.setProfile(undefined as unknown as Practitioner);
+    medplum.setProfile(undefined);
 
     const user = await setup(medplum);
 
@@ -451,15 +471,15 @@ describe('ParticipantFilter', () => {
     await user.click(button);
 
     await waitFor(() => {
-      const checkboxes = screen.getAllByRole('checkbox');
+      const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
       expect(checkboxes).toHaveLength(1);
     });
   });
 
   test('handles search error gracefully', async () => {
-    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockRejectedValue(new Error('Search failed'));
+    vi.spyOn(medplum, 'search').mockRejectedValue(new Error('Search failed'));
     const user = await setup(medplum);
 
     const button = screen.getByRole('button');
@@ -481,10 +501,10 @@ describe('ParticipantFilter', () => {
 
   test('handles search results with undefined resources', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
-      entry: [{ resource: mockPatient as WithId<Patient> }, { resource: undefined as unknown as WithId<Patient> }, {}],
+      entry: [{ resource: mockPatient as WithId<Patient> }, { resource: undefined }, {}],
     });
     const user = await setup(medplum);
 
@@ -505,7 +525,7 @@ describe('ParticipantFilter', () => {
 
   test('handles empty search query', async () => {
     const medplum = new MockClient();
-    const searchSpy = jest.spyOn(medplum, 'search');
+    const searchSpy = vi.spyOn(medplum, 'search');
     const user = await setup(medplum);
 
     const button = screen.getByRole('button');
@@ -518,8 +538,8 @@ describe('ParticipantFilter', () => {
     const searchInput = screen.getByPlaceholderText('Search for a Patient or Practitioner...');
     await user.type(searchInput, '   ');
 
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 400);
+    await act(async () => {
+      vi.advanceTimersByTime(400);
     });
 
     expect(searchSpy).not.toHaveBeenCalled();

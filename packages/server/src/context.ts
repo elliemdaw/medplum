@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { ProfileResource, WithId } from '@medplum/core';
-import { Logger, isUUID, parseLogLevel } from '@medplum/core';
+import { Logger, OperationOutcomeError, badRequest, isUUID, parseLogLevel } from '@medplum/core';
 import type {
   Bot,
   ClientApplication,
@@ -15,10 +15,10 @@ import type { NextFunction, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { getConfig } from './config/loader';
 import { getRepoForLogin } from './fhir/accesspolicy';
-import { FhirRateLimiter } from './fhir/fhirquota';
+import { FhirRateLimiter, getFhirQuotaConfig } from './fhir/fhirquota';
 import type { Repository, SystemRepository } from './fhir/repo';
 import { ResourceCap } from './fhir/resource-cap';
-import { globalLogger } from './logger';
+import { getLogger, globalLogger, writeLineToStdout } from './logger';
 import type { AuthState } from './oauth/middleware';
 import { authenticateTokenImpl } from './oauth/middleware';
 import { getRateLimitRedis } from './redis';
@@ -36,7 +36,11 @@ export class RequestContext implements IRequestContext {
     this.traceId = traceId;
     this.logger =
       logger ??
-      new Logger(write, { ...loggerMetadata, requestId, traceId }, parseLogLevel(getConfig().logLevel ?? 'info'));
+      new Logger(
+        writeLineToStdout,
+        { ...loggerMetadata, requestId, traceId },
+        parseLogLevel(getConfig().logLevel ?? 'info')
+      );
   }
 
   [Symbol.dispose](): void {
@@ -79,7 +83,7 @@ export class AuthenticatedRequestContext extends RequestContext {
     }
     super(requestId, traceId, options?.logger, loggerMetadata);
 
-    this.fhirRateLimiter = getFhirRateLimiter(authState, this.logger, options?.async);
+    this.fhirRateLimiter = getFhirRateLimiter(authState, this.logger);
     this.resourceCap = getResourceCap(authState, this.logger);
 
     this.authState = authState;
@@ -141,20 +145,29 @@ export function getAuthenticatedContext(): AuthenticatedRequestContext {
 }
 
 export async function attachRequestContext(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const { requestId, traceId } = requestIds(req);
+  let ctx: RequestContext | undefined;
   try {
-    let ctx: RequestContext;
-    const { requestId, traceId } = requestIds(req);
     const result = await authenticateTokenImpl(req);
     if (result) {
       const { authState, repo } = result;
       ctx = new AuthenticatedRequestContext(requestId, traceId, authState, repo);
-    } else {
-      ctx = new RequestContext(requestId, traceId);
     }
-    requestContextStore.run(ctx, () => next());
-  } catch (err) {
-    next(err);
+  } catch (err: any) {
+    // Ensure next() is called in a request context, so later middleware (e.g. logging) can run correctly
+    ctx ??= new RequestContext(requestId, traceId);
+    requestContextStore.run(ctx, () => {
+      getLogger().error('Authentication error', { err: err.toString(), stack: err.stack });
+      const outcome = badRequest('Authentication error');
+      outcome.issue[0].diagnostics = err.toString();
+      const wrappedErr = new OperationOutcomeError(outcome, { cause: err });
+      next(wrappedErr);
+    });
+    return;
   }
+
+  ctx ??= new RequestContext(requestId, traceId);
+  requestContextStore.run(ctx, () => next());
 }
 
 export function closeRequestContext(): void {
@@ -172,20 +185,18 @@ export function tryRunInRequestContext<T>(requestId: string | undefined, traceId
   }
 }
 
-export async function runInAsyncContext<T>(
+export async function runInAuthenticatedContext<T>(
   authState: Readonly<AuthState>,
   requestId: string | undefined,
   traceId: string | undefined,
+  options: AuthenticatedContextOptions | undefined,
   fn: () => T
 ): Promise<T> {
   const repo = await getRepoForLogin(authState, true);
   requestId ??= randomUUID();
   traceId ??= randomUUID();
 
-  return requestContextStore.run(
-    new AuthenticatedRequestContext(requestId, traceId, authState, repo, { async: true }),
-    fn
-  );
+  return requestContextStore.run(new AuthenticatedRequestContext(requestId, traceId, authState, repo, options), fn);
 }
 
 export function getTraceId(req: Request): string | undefined {
@@ -251,20 +262,10 @@ function requestIds(req: Request): { requestId: string; traceId: string } {
   return { requestId, traceId };
 }
 
-function write(msg: string): void {
-  process.stdout.write(msg + '\n');
-}
-
-function getFhirRateLimiter(authState: AuthState, logger?: Logger, async?: boolean): FhirRateLimiter | undefined {
-  const defaultUserLimit = authState.project?.systemSetting?.find((s) => s.name === 'userFhirQuota')?.valueInteger;
-  const userSpecificLimit = authState.userConfig.option?.find((o) => o.id === 'fhirQuota')?.valueInteger;
-  const userLimit = userSpecificLimit ?? defaultUserLimit ?? getConfig().defaultFhirQuota;
-
-  const perProjectLimit = authState.project?.systemSetting?.find((s) => s.name === 'totalFhirQuota')?.valueInteger;
-  const projectLimit = perProjectLimit ?? userLimit * 10;
-
+function getFhirRateLimiter(authState: AuthState, logger?: Logger): FhirRateLimiter | undefined {
+  const { userLimit, projectLimit } = getFhirQuotaConfig(authState);
   return authState.membership
-    ? new FhirRateLimiter(getRateLimitRedis(), authState, userLimit, projectLimit, logger ?? globalLogger, async)
+    ? new FhirRateLimiter(getRateLimitRedis(), authState, userLimit, projectLimit, logger ?? globalLogger)
     : undefined;
 }
 

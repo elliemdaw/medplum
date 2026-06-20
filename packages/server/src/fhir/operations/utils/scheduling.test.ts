@@ -1,9 +1,20 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { createReference, generateId } from '@medplum/core';
-import type { Practitioner, Project, Schedule, Slot } from '@medplum/fhirtypes';
+import type { WithId } from '@medplum/core';
+import { createReference, DEFAULT_MAX_SEARCH_COUNT, generateId } from '@medplum/core';
+import type { HealthcareService, Practitioner, Project, Schedule, Slot } from '@medplum/fhirtypes';
 import type { Interval } from '../../../util/date';
-import { applyExistingSlots, normalizeIntervals, removeAvailability, resolveAvailability } from './scheduling';
+import { LayeredDict } from '../../../util/layereddict';
+import { withPath } from '../../../util/withpath';
+import type { Repository } from '../../repo';
+import {
+  applyExistingSlots,
+  isAlignedToGrid,
+  normalizeIntervals,
+  removeAvailability,
+  resolveAvailability,
+  slotsOverlappingInterval,
+} from './scheduling';
 import type { SchedulingParameters } from './scheduling-parameters';
 
 const project: Project = {
@@ -24,14 +35,28 @@ const schedule: Schedule = {
   actor: [createReference(practitioner)],
 };
 
+const service: WithId<HealthcareService> = {
+  resourceType: 'HealthcareService',
+  id: generateId(),
+  meta: { project: project.id },
+};
+
 describe('resolveAvailability', () => {
+  const layered = (sp: SchedulingParameters): LayeredDict<SchedulingParameters> =>
+    LayeredDict.from(withPath(sp, 'test'));
+
   test('having multiple days and times', async () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['mon', 'wed', 'thu'],
-          timeOfDay: ['09:30:00', '13:15:00'],
-          duration: 180,
+          availableStartTime: '09:30:00',
+          availableEndTime: '12:30:00',
+        },
+        {
+          dayOfWeek: ['mon', 'wed', 'thu'],
+          availableStartTime: '13:15:00',
+          availableEndTime: '16:15:00',
         },
       ],
       duration: 20,
@@ -39,8 +64,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     const range = {
       start: new Date('2025-11-30T00:00:00.000-05:00'), // Start of Oct 30
@@ -59,12 +85,12 @@ describe('resolveAvailability', () => {
   });
 
   test('for an availability entry crossing midnight', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['mon'],
-          timeOfDay: ['15:20:00'],
-          duration: 600,
+          availableStartTime: '15:20:00',
+          availableEndTime: '01:20:00',
         },
       ],
       duration: 20,
@@ -72,8 +98,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     const range = {
       start: new Date('2025-11-30T00:00:00.000-05:00'), // Start of Oct 30
@@ -86,13 +113,13 @@ describe('resolveAvailability', () => {
     ]);
   });
 
-  test('availabilities crossing the start of the query range are clamped', () => {
-    const schedulingParameters: SchedulingParameters = {
+  test('all day availability', () => {
+    const schedulingParameters = layered({
       availability: [
         {
-          dayOfWeek: ['tue'],
-          timeOfDay: ['10:00:00'],
-          duration: 360,
+          dayOfWeek: ['mon', 'tue'],
+          availableStartTime: '00:00:00',
+          availableEndTime: '00:00:00',
         },
       ],
       duration: 20,
@@ -100,8 +127,40 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
+
+    const range = {
+      start: new Date('2025-11-30T00:00:00.000-05:00'), // Start of Oct 30
+      end: new Date('2025-12-03T23:59:59.999-05:00'), // End of Dec 3
     };
+
+    expect(resolveAvailability(schedulingParameters, range, 'America/New_York')).toEqual([
+      // Mon Dec 1, 00:00 ET - Wed Dec 2, 00:00 ET
+      { start: new Date('2025-12-01T05:00:00.000Z'), end: new Date('2025-12-02T05:00:00.000Z') },
+      // Mon Dec 2, 00:00 ET - Wed Dec 3, 00:00 ET
+      { start: new Date('2025-12-02T05:00:00.000Z'), end: new Date('2025-12-03T05:00:00.000Z') },
+    ]);
+  });
+
+  test('availabilities crossing the start of the query range are clamped', () => {
+    const schedulingParameters = layered({
+      availability: [
+        {
+          dayOfWeek: ['tue'],
+          availableStartTime: '10:00:00',
+          availableEndTime: '16:00:00',
+        },
+      ],
+      duration: 20,
+      bufferBefore: 0,
+      bufferAfter: 0,
+      alignmentInterval: 60,
+      alignmentOffset: 0,
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     const range = {
       start: new Date('2025-12-02T12:00:00.000-05:00'), // Tue Oct 2, noon ET
@@ -115,12 +174,12 @@ describe('resolveAvailability', () => {
   });
 
   test('availabilities crossing the end of the query range are clamped', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['tue'],
-          timeOfDay: ['10:00:00'],
-          duration: 360,
+          availableStartTime: '10:00:00',
+          availableEndTime: '16:00:00',
         },
       ],
       duration: 20,
@@ -128,8 +187,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     const range = {
       start: new Date('2025-12-02T04:00:00.000-05:00'), // Tue Oct 2, 4am ET
@@ -144,12 +204,12 @@ describe('resolveAvailability', () => {
 
   // regression test for https://github.com/medplum/medplum/issues/8417
   test('when the request starts early in a UTC day', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['tue', 'wed', 'thu'],
-          timeOfDay: ['20:00:00'],
-          duration: 360,
+          availableStartTime: '20:00:00',
+          availableEndTime: '02:00:00',
         },
       ],
       duration: 60,
@@ -157,8 +217,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     const range = {
       start: new Date('2026-01-14T19:00:00.000-05:00'), // Wed Jan 14, 7pm ET (which is Jan 15, 12am UTC)
@@ -172,12 +233,12 @@ describe('resolveAvailability', () => {
   });
 
   test('on days with DST transitions', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['sun'],
-          timeOfDay: ['10:00:00'],
-          duration: 360,
+          availableStartTime: '10:00:00',
+          availableEndTime: '16:00:00',
         },
       ],
       duration: 20,
@@ -185,8 +246,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     // NY has a DST "spring forward" on March 8 2026
     const springRange = {
@@ -210,12 +272,12 @@ describe('resolveAvailability', () => {
   });
 
   test('availability spanning a DST change', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['sun'],
-          timeOfDay: ['00:30:00'],
-          duration: 360,
+          availableStartTime: '00:30:00',
+          availableEndTime: '06:30:00',
         },
       ],
       duration: 20,
@@ -223,8 +285,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     // NY has a DST "spring forward" on March 8 2026
     const range = {
@@ -232,9 +295,10 @@ describe('resolveAvailability', () => {
       end: new Date('2026-03-08T08:00:00.000-04:00'), // Sun Mar 8, 8am EDT
     };
 
-    // Availability duration is 6 hours, spanning 12:30am (pre time-change) to 7:30am (post time-change)
+    // Local-time window 00:30–06:30: on a spring-forward day the window is 5 real hours
+    // (one hour skipped), ending at 06:30 EDT = 10:30Z
     expect(resolveAvailability(schedulingParameters, range, 'America/New_York')).toEqual([
-      { start: new Date('2026-03-08T05:30:00.000Z'), end: new Date('2026-03-08T11:30:00.000Z') },
+      { start: new Date('2026-03-08T05:30:00.000Z'), end: new Date('2026-03-08T10:30:00.000Z') },
     ]);
 
     // NY has a DST "fall back" on Nov 2 2025
@@ -243,19 +307,20 @@ describe('resolveAvailability', () => {
       end: new Date('2025-11-02T08:00:00.000-05:00'), // Sun Nov 2, 8am EST
     };
 
-    // Availability duration is 6 hours, spanning 12:30am (pre time-change) to 7:30am (post time-change)
+    // Local-time window 00:30–06:30: on a fall-back day the window is 7 real hours
+    // (one hour repeated), ending at 06:30 EST = 11:30Z
     expect(resolveAvailability(schedulingParameters, range2, 'America/New_York')).toEqual([
-      { start: new Date('2025-11-02T04:30:00.000Z'), end: new Date('2025-11-02T10:30:00.000Z') },
+      { start: new Date('2025-11-02T04:30:00.000Z'), end: new Date('2025-11-02T11:30:00.000Z') },
     ]);
   });
 
   test('availability on an ambiguous DST fall back time chooses the earlier option', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['sun'],
-          timeOfDay: ['01:30:00'],
-          duration: 360,
+          availableStartTime: '01:30:00',
+          availableEndTime: '06:30:00',
         },
       ],
       duration: 20,
@@ -263,8 +328,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     // NY has a DST "fall back" on Nov 2 2025: 1:30am: happens twice
     const range = {
@@ -272,19 +338,20 @@ describe('resolveAvailability', () => {
       end: new Date('2025-11-02T10:00:00.000-05:00'), // Sun Nov 2, 10am EST
     };
 
-    // Availability duration is 6 hours, spanning 1:30am (post time-change) to 7:30am (post time-change)
+    // 1:30am is ambiguous; Temporal picks the earlier (EDT) occurrence = 05:30Z.
+    // Window ends at 06:30 EST = 11:30Z.
     expect(resolveAvailability(schedulingParameters, range, 'America/New_York')).toEqual([
       { start: new Date('2025-11-02T05:30:00.000Z'), end: new Date('2025-11-02T11:30:00.000Z') },
     ]);
   });
 
   test('availability on an ambiguous DST spring forward time starts late', () => {
-    const schedulingParameters: SchedulingParameters = {
+    const schedulingParameters = layered({
       availability: [
         {
           dayOfWeek: ['sun'],
-          timeOfDay: ['02:30:00'],
-          duration: 360,
+          availableStartTime: '02:30:00',
+          availableEndTime: '09:30:00',
         },
       ],
       duration: 20,
@@ -292,8 +359,9 @@ describe('resolveAvailability', () => {
       bufferAfter: 0,
       alignmentInterval: 60,
       alignmentOffset: 0,
-      serviceType: [],
-    };
+      alignmentTimezone: 'America/New_York',
+      service: createReference(service),
+    });
 
     // NY has a DST "spring forward" on March 8 2026; 2:30am never happens
     const range = {
@@ -301,7 +369,7 @@ describe('resolveAvailability', () => {
       end: new Date('2026-03-08T10:00:00.000-04:00'), // Sun Mar 8, 10am EDT
     };
 
-    // Availability duration is 6 hours, spanning 03:30 (post time-change) to 09:30am (post time-change)
+    // 2:30am is skipped; Temporal advances to 03:30 EDT = 07:30Z. Window ends at 09:30 EDT = 13:30Z.
     expect(resolveAvailability(schedulingParameters, range, 'America/New_York')).toEqual([
       { start: new Date('2026-03-08T07:30:00.000Z'), end: new Date('2026-03-08T13:30:00.000Z') },
     ]);
@@ -438,6 +506,29 @@ describe('removeAvailability', () => {
   });
 });
 
+describe('slotsOverlappingInterval', () => {
+  test('throws when a full page of DEFAULT_MAX_SEARCH_COUNT slots is returned', async () => {
+    const mockSlot: Slot = {
+      resourceType: 'Slot',
+      status: 'busy',
+      start: '2025-12-01T10:00:00Z',
+      end: '2025-12-01T11:00:00Z',
+      schedule: { reference: `Schedule/${schedule.id}` },
+    };
+    const fullPage = Array.from({ length: DEFAULT_MAX_SEARCH_COUNT }, () => mockSlot);
+    const mockRepo = {
+      searchResources: async () => fullPage,
+    } as unknown as Repository;
+
+    await expect(
+      slotsOverlappingInterval(mockRepo, [schedule as WithId<Schedule>], {
+        start: new Date('2025-12-01'),
+        end: new Date('2025-12-31'),
+      })
+    ).rejects.toThrow('Too many slots found in range');
+  });
+});
+
 function makeSlots(
   schedule: Schedule,
   intervals: Interval[],
@@ -565,22 +656,22 @@ describe('applyExistingSlots', () => {
     const freeIntervals = [{ start: new Date('2025-12-01T10:00:00.000Z'), end: new Date('2025-12-01T14:00:00.000Z') }];
     const slots = makeSlots(schedule, freeIntervals, 'free'); // No serviceType
     const range = { start: new Date('2025-12-01'), end: new Date('2025-12-30') };
-    const serviceType = [{ system: 'http://example.com', code: 'office-visit' }];
+    const serviceType = [{ coding: [{ system: 'http://example.com', code: 'office-visit' }] }];
 
     expect(applyExistingSlots({ availability: [], slots, range, serviceType })).toEqual(freeIntervals);
   });
 
   test('free slots with matching service type are included', () => {
-    const serviceType = [{ system: 'http://example.com', code: 'office-visit' }];
+    const serviceType = [{ coding: [{ system: 'http://example.com', code: 'office-visit' }] }];
     const freeIntervals = [{ start: new Date('2025-12-01T10:00:00.000Z'), end: new Date('2025-12-01T14:00:00.000Z') }];
-    const slots = makeSlots(schedule, freeIntervals, 'free', [{ coding: serviceType }]);
+    const slots = makeSlots(schedule, freeIntervals, 'free', serviceType);
     const range = { start: new Date('2025-12-01'), end: new Date('2025-12-30') };
 
     expect(applyExistingSlots({ availability: [], slots, range, serviceType })).toEqual(freeIntervals);
   });
 
   test('free slots with non-matching service type are excluded', () => {
-    const serviceType = [{ system: 'http://example.com', code: 'office-visit' }];
+    const serviceType = [{ coding: [{ system: 'http://example.com', code: 'office-visit' }] }];
     const freeIntervals = [{ start: new Date('2025-12-01T10:00:00.000Z'), end: new Date('2025-12-01T14:00:00.000Z') }];
     const slotServiceType = [{ coding: [{ system: 'http://example.com', code: 'new-patient' }] }];
     const slots = makeSlots(schedule, freeIntervals, 'free', slotServiceType);
@@ -591,7 +682,7 @@ describe('applyExistingSlots', () => {
 
   test('free slots do not match when system matches but code differs', () => {
     const system = 'http://example.com';
-    const serviceType = [{ system, code: 'checkup' }];
+    const serviceType = [{ coding: [{ system, code: 'checkup' }] }];
     const freeIntervals = [{ start: new Date('2025-12-01T10:00:00.000Z'), end: new Date('2025-12-01T14:00:00.000Z') }];
     const slotServiceType = [{ coding: [{ system, code: 'office-visit' }] }];
     const slots = makeSlots(schedule, freeIntervals, 'free', slotServiceType);
@@ -601,7 +692,7 @@ describe('applyExistingSlots', () => {
 
   test('free slots do not match when code matches but system differs', () => {
     const code = 'office-visit';
-    const serviceType = [{ system: 'http://other.com', code }];
+    const serviceType = [{ coding: [{ system: 'http://other.com', code }] }];
     const freeIntervals = [{ start: new Date('2025-12-01T10:00:00.000Z'), end: new Date('2025-12-01T14:00:00.000Z') }];
     const slotServiceType = [{ coding: [{ system: 'http://example.com', code }] }];
     const slots = makeSlots(schedule, freeIntervals, 'free', slotServiceType);
@@ -619,8 +710,75 @@ describe('applyExistingSlots', () => {
     ];
     const slots = makeSlots(schedule, freeIntervals, 'free', slotServiceType);
     const range = { start: new Date('2025-12-01'), end: new Date('2025-12-30') };
-    const serviceType = [{ system: 'http://example.com', code: 'office-visit' }];
+    const serviceType = [{ coding: [{ system: 'http://example.com', code: 'office-visit' }] }];
 
     expect(applyExistingSlots({ availability: [], slots, range, serviceType })).toEqual(freeIntervals);
+  });
+});
+
+describe('isAlignedToGrid', () => {
+  const opts = { interval: 60, offset: 0, timezone: 'Etc/UTC' };
+
+  test('returns true for a date exactly on the hourly grid', () => {
+    expect(isAlignedToGrid(new Date('2025-12-01T09:00:00Z'), opts)).toBe(true);
+  });
+
+  test('returns false for a date not on the grid', () => {
+    expect(isAlignedToGrid(new Date('2025-12-01T09:37:00Z'), opts)).toBe(false);
+  });
+
+  test('returns false for a date with non-zero seconds', () => {
+    expect(isAlignedToGrid(new Date('2025-12-01T09:00:30Z'), opts)).toBe(false);
+  });
+
+  test('returns false for a date with non-zero milliseconds', () => {
+    expect(isAlignedToGrid(new Date('2025-12-01T09:00:00.500Z'), opts)).toBe(false);
+  });
+
+  test('respects alignmentOffset', () => {
+    const withOffset = { interval: 20, offset: 5, timezone: 'Etc/UTC' };
+    expect(isAlignedToGrid(new Date('2025-12-01T09:05:00Z'), withOffset)).toBe(true);
+    expect(isAlignedToGrid(new Date('2025-12-01T09:25:00Z'), withOffset)).toBe(true);
+    expect(isAlignedToGrid(new Date('2025-12-01T09:00:00Z'), withOffset)).toBe(false);
+    expect(isAlignedToGrid(new Date('2025-12-01T09:10:00Z'), withOffset)).toBe(false);
+  });
+
+  test('anchors to local midnight for non-UTC timezones', () => {
+    // America/Chicago in December is CST (UTC-6); local midnight = 06:00 UTC.
+    // With 50-min alignment, the Chicago and UTC grids differ (360 % 50 = 10).
+    // 09:20 UTC = 03:20 CST = 200 min since local midnight; 200 % 50 = 0 — on the Chicago grid
+    expect(
+      isAlignedToGrid(new Date('2025-12-01T09:20:00Z'), {
+        interval: 50,
+        offset: 0,
+        timezone: 'America/Chicago',
+      })
+    ).toBe(true);
+    // 09:10 UTC = 03:10 CST = 190 min since local midnight; 190 % 50 = 40 — not on the Chicago grid
+    expect(
+      isAlignedToGrid(new Date('2025-12-01T09:10:00Z'), {
+        interval: 50,
+        offset: 0,
+        timezone: 'America/Chicago',
+      })
+    ).toBe(false);
+  });
+
+  test('re-anchors the grid at local midnight for slots spanning midnight', () => {
+    // America/Chicago in December is CST (UTC-6); local midnight = 06:00 UTC.
+    // With 50-min alignment, the last grid point on Dec 1 is 23:20 CST = 05:20 UTC Dec 2
+    // (1400 min since Dec 1 midnight; 1400 % 50 = 0).
+    const lastSlotDec1 = new Date('2025-12-02T05:20:00Z');
+    expect(isAlignedToGrid(lastSlotDec1, { interval: 50, offset: 0, timezone: 'America/Chicago' })).toBe(true);
+
+    // Naïve continuation past Dec 1's grid would land at 00:10 CST Dec 2 = 06:10 UTC Dec 2
+    // (10 min since Dec 2 midnight; 10 % 50 = 10) — not on the re-anchored Dec 2 grid.
+    const naiveContinuation = new Date('2025-12-02T06:10:00Z');
+    expect(isAlignedToGrid(naiveContinuation, { interval: 50, offset: 0, timezone: 'America/Chicago' })).toBe(false);
+
+    // The actual first slot on Dec 2 is 00:00 CST = 06:00 UTC Dec 2
+    // (0 min since Dec 2 midnight; 0 % 50 = 0).
+    const firstSlotDec2 = new Date('2025-12-02T06:00:00Z');
+    expect(isAlignedToGrid(firstSlotDec2, { interval: 50, offset: 0, timezone: 'America/Chicago' })).toBe(true);
   });
 });

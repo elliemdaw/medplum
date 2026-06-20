@@ -22,10 +22,12 @@ import type { Agent, AgentChannel, Bot, Endpoint, Resource } from '@medplum/fhir
 import type { Hl7Connection } from '@medplum/hl7';
 import { Hl7Client, Hl7EnhancedAckSentEvent, Hl7Server, ReturnAckCategory } from '@medplum/hl7';
 import { MockClient } from '@medplum/mock';
-import { randomUUID } from 'crypto';
 import type { Client } from 'mock-socket';
 import { Server } from 'mock-socket';
+import { randomUUID } from 'node:crypto';
+import type { Mock } from 'vitest';
 import { App } from './app';
+import type * as AgentConstants from './constants';
 import type { AppLevelAckMode } from './hl7';
 import {
   AgentHl7Channel,
@@ -36,45 +38,44 @@ import {
   parseEnhancedMode,
   shouldSendAppLevelAck,
 } from './hl7';
-import { createMockLogger } from './test-utils';
+import { createEndpointWithRandomPort, createMockLogger, getFreePort } from './test-utils';
 
-jest.mock('./constants', () => ({
-  ...jest.requireActual('./constants'),
-  // We don't care about how fast the clients release in these tests
-  CLIENT_RELEASE_COUNTDOWN_MS: 0,
-}));
+vi.mock('./constants', async (importOriginal) => {
+  const actual = await importOriginal<typeof AgentConstants>();
+  return {
+    ...actual,
+    RETRY_WAIT_DURATION_MS: 200,
+    // We don't care about how fast the clients release in these tests
+    CLIENT_RELEASE_COUNTDOWN_MS: 0,
+  };
+});
 
 const medplum = new MockClient();
+const BASE_ENDPOINT: Endpoint = {
+  resourceType: 'Endpoint',
+  status: 'active',
+  address: 'mllp://0.0.0.0:57000',
+  connectionType: { code: ContentType.HL7_V2 },
+  payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
+};
+
 let bot: Bot;
-let endpoint: Endpoint;
 
 describe('HL7', () => {
   beforeAll(async () => {
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     medplum.router.router.add('POST', ':resourceType/:id/$execute', async () => {
       return [allOk, {} as Resource];
     });
 
     bot = await medplum.createResource<Bot>({ resourceType: 'Bot' });
-
-    endpoint = await medplum.createResource<Endpoint>({
-      resourceType: 'Endpoint',
-      status: 'active',
-      address: 'mllp://0.0.0.0:57000',
-      connectionType: { code: ContentType.HL7_V2 },
-      payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
-    });
   });
 
   let mockServer: Server;
   beforeEach(() => {
     mockServer = new Server('wss://example.com/ws/agent');
   });
-  afterEach(() => {
-    mockServer.stop();
-  });
-
   test('Send and receive', async () => {
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -118,6 +119,8 @@ describe('HL7', () => {
       });
     });
 
+    const [endpoint, port] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
@@ -136,7 +139,7 @@ describe('HL7', () => {
 
     const client = new Hl7Client({
       host: 'localhost',
-      port: 57000,
+      port,
     });
 
     const response = await client.sendAndWait(
@@ -158,7 +161,7 @@ describe('HL7', () => {
 
   test('Send and receive -- error', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -202,6 +205,8 @@ describe('HL7', () => {
       });
     });
 
+    const [endpoint, port] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
@@ -220,7 +225,7 @@ describe('HL7', () => {
 
     const client = new Hl7Client({
       host: 'localhost',
-      port: 57000,
+      port,
     });
 
     await client.send(
@@ -244,7 +249,7 @@ describe('HL7', () => {
 
   test('Send and receive -- no callback in response', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -289,6 +294,8 @@ describe('HL7', () => {
       });
     });
 
+    const [endpoint, port] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
@@ -307,7 +314,7 @@ describe('HL7', () => {
 
     const client = new Hl7Client({
       host: 'localhost',
-      port: 57000,
+      port,
     });
 
     await client.send(
@@ -370,10 +377,9 @@ describe('HL7', () => {
       });
     });
 
-    const enhancedEndpoint = await medplum.createResource<Endpoint>({
-      ...endpoint,
-      id: undefined,
-      address: endpoint.address + '?enhanced=true',
+    const [enhancedEndpoint, port] = await createEndpointWithRandomPort(medplum, {
+      ...BASE_ENDPOINT,
+      address: BASE_ENDPOINT.address + '?enhanced=true',
     });
 
     const agent = await medplum.createResource<Agent>({
@@ -394,7 +400,7 @@ describe('HL7', () => {
 
     const client = new Hl7Client({
       host: 'localhost',
-      port: 57000,
+      port,
     });
 
     const response = await client.sendAndWait(
@@ -413,6 +419,106 @@ describe('HL7', () => {
     // Should see info severity level
     expect(response.segments).toHaveLength(2);
     expect(response.segments[1].name).toBe('MSA');
+
+    await client.close();
+    await app.stop();
+  });
+
+  // Regression: in aaMode the agent sends the AA immediately and the cloud's
+  // app-level ACK is suppressed (never forwarded to the remote). The suppression
+  // path must still clear the pending RTT entry, otherwise every message lingers
+  // and is eventually GC'd with a "never got response" warning.
+  test('Send and receive -- aaMode clears pending RTT entry', async () => {
+    mockServer.on('connection', (socket) => {
+      socket.on('message', (data) => {
+        const command = JSON.parse((data as Buffer).toString('utf8'));
+        if (command.type === 'agent:connect:request') {
+          socket.send(
+            Buffer.from(
+              JSON.stringify({
+                type: 'agent:connect:response',
+              })
+            )
+          );
+        }
+
+        if (command.type === 'agent:transmit:request') {
+          const hl7Message = Hl7Message.parse(command.body);
+          const ackMessage = hl7Message.buildAck();
+          socket.send(
+            Buffer.from(
+              JSON.stringify({
+                type: 'agent:transmit:response',
+                channel: command.channel,
+                callback: command.callback,
+                remote: command.remote,
+                body: ackMessage.toString(),
+              })
+            )
+          );
+        }
+
+        if (command.type === 'agent:heartbeat:request') {
+          socket.send(
+            Buffer.from(
+              JSON.stringify({
+                type: 'agent:heartbeat:response',
+                version: MEDPLUM_VERSION,
+              } satisfies AgentHeartbeatResponse)
+            )
+          );
+        }
+      });
+    });
+
+    const [aaEndpoint, port] = await createEndpointWithRandomPort(medplum, {
+      ...BASE_ENDPOINT,
+      address: BASE_ENDPOINT.address + '?enhanced=aa',
+    });
+
+    const agent = await medplum.createResource<Agent>({
+      resourceType: 'Agent',
+      name: 'Test Agent',
+      status: 'active',
+      channel: [
+        {
+          name: 'test',
+          endpoint: createReference(aaEndpoint),
+          targetReference: createReference(bot),
+        },
+      ],
+    });
+
+    const app = new App(medplum, agent.id, LogLevel.INFO);
+    await app.start();
+
+    const client = new Hl7Client({
+      host: 'localhost',
+      port,
+    });
+
+    const response = await client.sendAndWait(
+      Hl7Message.parse(
+        'MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG00001|P|2.5\r' +
+          'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
+          'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
+          'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-'
+      ),
+      { returnAck: ReturnAckCategory.FIRST }
+    );
+    // In aaMode the agent answers with an immediate application ACK (AA)
+    expect(response.getSegment('MSA')?.getComponent(1, 1)).toStrictEqual('AA');
+
+    // The cloud's app-level ACK is delivered asynchronously and suppressed at the
+    // agent; give it a moment to flow back and clear the pending entry.
+    const channel = app.channels.get('test') as AgentHl7Channel;
+    for (let i = 0; i < 10 && channel.stats.getPendingCount() > 0; i++) {
+      await sleep(20);
+    }
+
+    // Pending entry cleared, and the round-trip was recorded as a completed RTT sample
+    expect(channel.stats.getPendingCount()).toBe(0);
+    expect(channel.stats.getSampleCount()).toBe(1);
 
     await client.close();
     await app.stop();
@@ -461,9 +567,8 @@ describe('HL7', () => {
       });
     });
 
-    const enhancedEndpoint = await medplum.createResource<Endpoint>({
-      ...endpoint,
-      id: undefined,
+    const [enhancedEndpoint, port] = await createEndpointWithRandomPort(medplum, {
+      ...BASE_ENDPOINT,
       address: 'mllp://0.0.0.0:57010?enhanced=true&messagesPerMin=60',
     });
 
@@ -485,7 +590,7 @@ describe('HL7', () => {
 
     const client = new Hl7Client({
       host: 'localhost',
-      port: 57010,
+      port,
     });
 
     const startTime = Date.now();
@@ -525,7 +630,7 @@ describe('HL7', () => {
 
   test('Invalid messagesPerMin logs warning', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -542,9 +647,8 @@ describe('HL7', () => {
       });
     });
 
-    const enhancedEndpoint = await medplum.createResource<Endpoint>({
-      ...endpoint,
-      id: undefined,
+    const [enhancedEndpoint] = await createEndpointWithRandomPort(medplum, {
+      ...BASE_ENDPOINT,
       address: 'mllp://0.0.0.0:57010?enhanced=true&messagesPerMin=twenty',
     });
 
@@ -594,17 +698,12 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
     });
 
     // Start an HL7 listener
@@ -615,7 +714,7 @@ describe('HL7', () => {
         conn.send(message.buildAck());
       });
     });
-    await hl7Server.start(57001);
+    await hl7Server.start(port);
 
     // Start the app
     const app = new App(medplum, agent.id, LogLevel.INFO);
@@ -641,7 +740,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
         })
       )
     );
@@ -653,7 +752,7 @@ describe('HL7', () => {
     expect(hl7Messages.length).toBe(1);
 
     // Shutdown everything
-    await hl7Server.stop();
+    await hl7Server.stop({ forceDrainTimeoutMs: 100 });
     await app.stop();
   });
 
@@ -687,15 +786,10 @@ describe('HL7', () => {
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [{ name: 'keepAlive', valueBoolean: false }],
     });
+
+    const port = await getFreePort();
 
     // Start an HL7 listener
     const hl7Messages = [];
@@ -705,7 +799,7 @@ describe('HL7', () => {
         conn.send(message.buildAck());
       });
     });
-    await hl7Server.start(57001);
+    await hl7Server.start(port);
 
     // Start the app
     const app = new App(medplum, agent.id, LogLevel.INFO);
@@ -731,7 +825,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -744,10 +838,10 @@ describe('HL7', () => {
     expect(hl7Messages.length).toBe(1);
 
     // Run GC manually
-    app.hl7Clients.get('mllp://localhost:57001')?.runClientGc();
+    app.hl7Clients.get(`mllp://localhost:${port}`)?.runClientGc();
 
     // Make sure we are not keeping clients around yet
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     wsClient.send(
       Buffer.from(
@@ -758,7 +852,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -772,9 +866,9 @@ describe('HL7', () => {
     expect(hl7Messages.length).toBe(2);
 
     // Run GC manually
-    app.hl7Clients.get('mllp://localhost:57001')?.runClientGc();
+    app.hl7Clients.get(`mllp://localhost:${port}`)?.runClientGc();
 
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     // Update config and make agent reload config
     const updatedAgent1 = await medplum.updateResource({
@@ -808,7 +902,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -820,10 +914,10 @@ describe('HL7', () => {
     }
 
     expect(hl7Messages.length).toBe(3);
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // Capture the socket from the kept-alive client
-    const pool = app.hl7Clients.get('mllp://localhost:57001');
+    const pool = app.hl7Clients.get(`mllp://localhost:${port}`);
     expect(pool).toBeDefined();
     const clientsBeforeReload = pool?.getClients();
     expect(clientsBeforeReload).toBeDefined();
@@ -843,7 +937,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -855,7 +949,7 @@ describe('HL7', () => {
     }
 
     expect(hl7Messages.length).toBe(4);
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // Set the config back to keepAlive !== true
     const updatedAgent2 = await medplum.updateResource({
@@ -892,7 +986,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -906,9 +1000,9 @@ describe('HL7', () => {
     expect(hl7Messages.length).toBe(5);
 
     // Run GC manually
-    app.hl7Clients.get('mllp://localhost:57001')?.runClientGc();
+    app.hl7Clients.get(`mllp://localhost:${port}`)?.runClientGc();
 
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     wsClient.send(
       Buffer.from(
@@ -919,7 +1013,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -933,12 +1027,12 @@ describe('HL7', () => {
     expect(hl7Messages.length).toBe(6);
 
     // Run GC manually
-    app.hl7Clients.get('mllp://localhost:57001')?.runClientGc();
+    app.hl7Clients.get(`mllp://localhost:${port}`)?.runClientGc();
 
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     // Shutdown everything
-    await hl7Server.stop();
+    await hl7Server.stop({ forceDrainTimeoutMs: 100 });
     await app.stop();
 
     // Make sure all clients are closed after stopping app
@@ -947,7 +1041,7 @@ describe('HL7', () => {
 
   test('keepAlive: Remote closes connection', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     const state = {
       reloadConfigResponse: null as AgentReloadConfigResponse | null,
@@ -973,18 +1067,13 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     // Start with keepAlive = false
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [{ name: 'keepAlive', valueBoolean: true }],
     });
 
@@ -1002,7 +1091,7 @@ describe('HL7', () => {
         conn.socket.destroy();
       });
     });
-    await hl7Server.start(57001);
+    await hl7Server.start(port);
 
     // Start the app
     const app = new App(medplum, agent.id, LogLevel.INFO);
@@ -1028,7 +1117,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -1039,20 +1128,20 @@ describe('HL7', () => {
       await sleep(20);
     }
     expect(hl7Messages.length).toBe(1);
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // After stopping the server (and therefore closing the connection),
     // We should no longer have an open client to the given server
-    await hl7Server.stop();
-    while (app.hl7Clients.get('mllp://localhost:57001')?.size() !== 0) {
+    await hl7Server.stop({ forceDrainTimeoutMs: 100 });
+    while (app.hl7Clients.get(`mllp://localhost:${port}`)?.size() !== 0) {
       await sleep(20);
     }
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     await app.stop();
 
     expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("Persistent connection to remote 'mllp://localhost:57001' closed")
+      expect.stringContaining(`Persistent connection to remote 'mllp://localhost:${port}' closed`)
     );
 
     console.log = originalConsoleLog;
@@ -1060,7 +1149,7 @@ describe('HL7', () => {
 
   test('keepAlive: Error occurs', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     const state = {
       reloadConfigResponse: null as AgentReloadConfigResponse | null,
@@ -1086,17 +1175,12 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [{ name: 'keepAlive', valueBoolean: true }],
     });
 
@@ -1123,7 +1207,7 @@ describe('HL7', () => {
         });
       }
     });
-    await hl7Server.start(57001);
+    await hl7Server.start(port);
 
     // Start the app
     const app = new App(medplum, agent.id, LogLevel.INFO);
@@ -1149,7 +1233,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
         })
       )
     );
@@ -1159,10 +1243,10 @@ describe('HL7', () => {
       await sleep(20);
     }
     expect(hl7Messages.length).toBe(1);
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // An error happened
-    const hl7ClientPool = app.hl7Clients.get('mllp://localhost:57001');
+    const hl7ClientPool = app.hl7Clients.get(`mllp://localhost:${port}`);
     expect(hl7ClientPool).toBeDefined();
     const clients = hl7ClientPool?.getClients();
     expect(clients).toBeDefined();
@@ -1175,14 +1259,14 @@ describe('HL7', () => {
 
     // We should no longer have an open client to the given server
     // Since an error has occurred
-    while (app.hl7Clients.get('mllp://localhost:57001')?.size() !== 0) {
+    while (app.hl7Clients.get(`mllp://localhost:${port}`)?.size() !== 0) {
       await sleep(20);
     }
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
-        `Persistent connection to remote 'mllp://localhost:57001' encountered error: 'Something bad happened' - Closing connection...`
+        `Persistent connection to remote 'mllp://localhost:${port}' encountered error: 'Something bad happened' - Closing connection...`
       )
     );
 
@@ -1199,7 +1283,7 @@ describe('HL7', () => {
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
             'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
             'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-',
-          remote: 'mllp://localhost:57001',
+          remote: `mllp://localhost:${port}`,
         })
       )
     );
@@ -1212,9 +1296,9 @@ describe('HL7', () => {
     }
 
     expect(hl7Messages.length).toBe(2);
-    expect(app.hl7Clients.get('mllp://localhost:57001')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
-    await hl7Server.stop();
+    await hl7Server.stop({ forceDrainTimeoutMs: 100 });
     await app.stop();
 
     console.log = originalConsoleLog;
@@ -1239,17 +1323,12 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
     });
 
     // Start an HL7 listener that doesn't respond immediately
@@ -1261,7 +1340,7 @@ describe('HL7', () => {
         });
       });
     });
-    await hl7Server.start(57002);
+    await hl7Server.start(port);
 
     const app = new App(medplum, agent.id, LogLevel.INFO);
     await app.start();
@@ -1285,7 +1364,7 @@ describe('HL7', () => {
                 body:
                   `MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG${i.toString().padStart(5, '0')}|P|2.2\r` +
                   'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-',
-                remote: 'mllp://localhost:57002',
+                remote: `mllp://localhost:${port}`,
                 contentType: ContentType.HL7_V2,
               } satisfies AgentTransmitRequest)
             )
@@ -1302,7 +1381,7 @@ describe('HL7', () => {
     }
 
     // Pool should have exactly 5 clients
-    expect(app.hl7Clients.get('mllp://localhost:57002')?.size()).toStrictEqual(5);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(5);
 
     // Send one more message - should wait since we're at limit
     wsClient.send(
@@ -1312,7 +1391,7 @@ describe('HL7', () => {
           body:
             'MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG00010|P|2.2\r' +
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-',
-          remote: 'mllp://localhost:57002',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -1322,7 +1401,7 @@ describe('HL7', () => {
     await sleep(50);
 
     // Should still be at 5 clients, not 6
-    expect(app.hl7Clients.get('mllp://localhost:57002')?.size()).toStrictEqual(5);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(5);
 
     // Release one message
     releaseMessages[0]();
@@ -1334,7 +1413,7 @@ describe('HL7', () => {
     }
 
     // Still should have at most 5 clients at any time
-    expect(app.hl7Clients.get('mllp://localhost:57002')?.size()).toBeLessThanOrEqual(5);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toBeLessThanOrEqual(5);
 
     // Release remaining messages
     for (let i = 1; i < releaseMessages.length; i++) {
@@ -1343,15 +1422,15 @@ describe('HL7', () => {
 
     // Run GC manually
     // This test sends a few messages very quickly and so its likely these clients are clearing out messages for a few ms
-    while (app.hl7Clients.get('mllp://localhost:57002')?.size()) {
+    while (app.hl7Clients.get(`mllp://localhost:${port}`)?.size()) {
       await sleep(20);
-      app.hl7Clients.get('mllp://localhost:57002')?.runClientGc();
+      app.hl7Clients.get(`mllp://localhost:${port}`)?.runClientGc();
     }
 
     // Should have no clients left in pool after all messages released
-    expect(app.hl7Clients.get('mllp://localhost:57002')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
-    await hl7Server.stop();
+    await hl7Server.stop({ forceDrainTimeoutMs: 100 });
     await app.stop();
   });
 
@@ -1374,17 +1453,12 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [{ name: 'keepAlive', valueBoolean: true }],
     });
 
@@ -1396,7 +1470,7 @@ describe('HL7', () => {
         });
       });
     });
-    await hl7Server.start(57003);
+    await hl7Server.start(port);
 
     const app = new App(medplum, agent.id, LogLevel.INFO);
     await app.start();
@@ -1417,7 +1491,7 @@ describe('HL7', () => {
             body:
               `MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG${i.toString().padStart(5, '0')}|P|2.2\r` +
               'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-',
-            remote: 'mllp://localhost:57003',
+            remote: `mllp://localhost:${port}`,
             contentType: ContentType.HL7_V2,
           } satisfies AgentTransmitRequest)
         )
@@ -1430,7 +1504,7 @@ describe('HL7', () => {
     }
 
     // Pool should have exactly 1 client (default for keepAlive)
-    expect(app.hl7Clients.get('mllp://localhost:57003')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // Second and third messages should be waiting
     expect(releaseMessages.length).toStrictEqual(3);
@@ -1444,7 +1518,7 @@ describe('HL7', () => {
     }
 
     // Should still be 1 client (reused in keepAlive mode)
-    expect(app.hl7Clients.get('mllp://localhost:57003')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // Release second message
     releaseMessages[1]();
@@ -1455,7 +1529,7 @@ describe('HL7', () => {
     }
 
     // Should still be 1 client
-    expect(app.hl7Clients.get('mllp://localhost:57003')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     // Release third message
     releaseMessages[2]();
@@ -1463,7 +1537,7 @@ describe('HL7', () => {
     await sleep(50);
 
     // Should still be 1 client
-    expect(app.hl7Clients.get('mllp://localhost:57003')?.size()).toStrictEqual(1);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(1);
 
     await app.stop();
     await hl7Server.stop({ forceDrainTimeoutMs: 100 });
@@ -1488,17 +1562,12 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [
         { name: 'keepAlive', valueBoolean: false },
         { name: 'maxClientsPerRemote', valueInteger: 3 },
@@ -1513,7 +1582,7 @@ describe('HL7', () => {
         });
       });
     });
-    await hl7Server.start(57004);
+    await hl7Server.start(port);
 
     const app = new App(medplum, agent.id, LogLevel.INFO);
     await app.start();
@@ -1534,7 +1603,7 @@ describe('HL7', () => {
             body:
               `MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG${i.toString().padStart(5, '0')}|P|2.2\r` +
               'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-',
-            remote: 'mllp://localhost:57004',
+            remote: `mllp://localhost:${port}`,
             contentType: ContentType.HL7_V2,
           } satisfies AgentTransmitRequest)
         )
@@ -1547,7 +1616,7 @@ describe('HL7', () => {
     }
 
     // Pool should have exactly 3 clients (our custom limit)
-    expect(app.hl7Clients.get('mllp://localhost:57004')?.size()).toStrictEqual(3);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(3);
 
     await sleep(50);
     expect(releaseMessages.length).toStrictEqual(5);
@@ -1572,13 +1641,13 @@ describe('HL7', () => {
 
     // Run GC manually
     // We do it in a loop until all clients are idle and get cleaned up
-    while (app.hl7Clients.get('mllp://localhost:57004')?.size()) {
+    while (app.hl7Clients.get(`mllp://localhost:${port}`)?.size()) {
       await sleep(20);
-      app.hl7Clients.get('mllp://localhost:57004')?.runClientGc();
+      app.hl7Clients.get(`mllp://localhost:${port}`)?.runClientGc();
     }
 
     // Pool should have exactly 0 clients after all messages complete
-    expect(app.hl7Clients.get('mllp://localhost:57004')?.size()).toStrictEqual(0);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(0);
 
     await app.stop();
     await hl7Server.stop({ forceDrainTimeoutMs: 100 });
@@ -1603,17 +1672,12 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [
         { name: 'keepAlive', valueBoolean: true },
         { name: 'maxClientsPerRemote', valueInteger: 6 },
@@ -1621,16 +1685,14 @@ describe('HL7', () => {
     });
 
     const releaseMessages: (() => void)[] = [];
-    const hl7Messages: Hl7Message[] = [];
     const hl7Server = new Hl7Server((conn) => {
       conn.addEventListener('message', ({ message }) => {
-        hl7Messages.push(message);
         releaseMessages.push(() => {
           conn.send(message.buildAck());
         });
       });
     });
-    await hl7Server.start(57005);
+    await hl7Server.start(port);
 
     const app = new App(medplum, agent.id, LogLevel.INFO);
     await app.start();
@@ -1651,7 +1713,7 @@ describe('HL7', () => {
             body:
               `MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG${i.toString().padStart(5, '0')}|P|2.2\r` +
               'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-',
-            remote: 'mllp://localhost:57005',
+            remote: `mllp://localhost:${port}`,
             contentType: ContentType.HL7_V2,
           } satisfies AgentTransmitRequest)
         )
@@ -1664,7 +1726,7 @@ describe('HL7', () => {
     }
 
     // Pool should have exactly 5 clients (our custom limit for keepAlive)
-    expect(app.hl7Clients.get('mllp://localhost:57005')?.size()).toStrictEqual(6);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(6);
 
     // Should not have received more than 5 messages yet
     await sleep(50);
@@ -1682,7 +1744,7 @@ describe('HL7', () => {
     }
 
     // Should still have 5 clients max (reused in keepAlive)
-    expect(app.hl7Clients.get('mllp://localhost:57005')?.size()).toStrictEqual(6);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(6);
 
     // All 8 messages should now be processed
     expect(releaseMessages.length).toStrictEqual(9);
@@ -1695,7 +1757,7 @@ describe('HL7', () => {
     await sleep(50);
 
     // Should still have 5 clients max
-    expect(app.hl7Clients.get('mllp://localhost:57005')?.size()).toStrictEqual(6);
+    expect(app.hl7Clients.get(`mllp://localhost:${port}`)?.size()).toStrictEqual(6);
 
     await app.stop();
     await hl7Server.stop({ forceDrainTimeoutMs: 100 });
@@ -1726,18 +1788,13 @@ describe('HL7', () => {
       });
     });
 
+    const port = await getFreePort();
+
     // Start with keepAlive = true and maxClientsPerRemote = 2
     const agent = await medplum.createResource<Agent>({
       resourceType: 'Agent',
       name: 'Test Agent',
       status: 'active',
-      channel: [
-        {
-          name: 'test',
-          endpoint: createReference(endpoint),
-          targetReference: createReference(bot),
-        },
-      ],
       setting: [
         { name: 'keepAlive', valueBoolean: true },
         { name: 'maxClientsPerRemote', valueInteger: 2 },
@@ -1751,7 +1808,7 @@ describe('HL7', () => {
         conn.send(message.buildAck());
       });
     });
-    await hl7Server.start(57006);
+    await hl7Server.start(port);
 
     const app = new App(medplum, agent.id, LogLevel.INFO);
     await app.start();
@@ -1771,7 +1828,7 @@ describe('HL7', () => {
           body:
             'MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG00001|P|2.2\r' +
             'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-',
-          remote: 'mllp://localhost:57006',
+          remote: `mllp://localhost:${port}`,
           contentType: ContentType.HL7_V2,
         } satisfies AgentTransmitRequest)
       )
@@ -1783,7 +1840,7 @@ describe('HL7', () => {
     }
 
     // Pool should exist with maxClients = 2
-    const pool = app.hl7Clients.get('mllp://localhost:57006');
+    const pool = app.hl7Clients.get(`mllp://localhost:${port}`);
     expect(pool).toBeDefined();
     expect(pool?.getMaxClients()).toStrictEqual(2);
 
@@ -1810,7 +1867,7 @@ describe('HL7', () => {
     }
 
     // Pool should still exist since keepAlive didn't change
-    const poolAfterReload = app.hl7Clients.get('mllp://localhost:57006');
+    const poolAfterReload = app.hl7Clients.get(`mllp://localhost:${port}`);
     expect(poolAfterReload).toBeDefined();
     // Verify maxClients was updated to 5
     expect(poolAfterReload?.getMaxClients()).toStrictEqual(5);
@@ -1894,12 +1951,9 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://0.0.0.0:57100?assignSeqNo=true',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
+      const [endpoint, port] = await createEndpointWithRandomPort(medplum, {
+        ...BASE_ENDPOINT,
+        address: 'mllp://0.0.0.0:57001?assignSeqNo=true',
       });
 
       const agent = await medplum.createResource<Agent>({
@@ -1920,7 +1974,7 @@ describe('HL7', () => {
 
       const client = new Hl7Client({
         host: 'localhost',
-        port: 57100,
+        port,
       });
 
       // Send multiple messages in sequence
@@ -2005,12 +2059,9 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://0.0.0.0:57101?assignSeqNo=true',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
+      const [endpoint, port] = await createEndpointWithRandomPort(medplum, {
+        ...BASE_ENDPOINT,
+        address: 'mllp://0.0.0.0:57001?assignSeqNo=true',
       });
 
       const agent = await medplum.createResource<Agent>({
@@ -2036,7 +2087,7 @@ describe('HL7', () => {
 
       const client = new Hl7Client({
         host: 'localhost',
-        port: 57101,
+        port,
       });
 
       // Send 3 messages before reload
@@ -2063,7 +2114,7 @@ describe('HL7', () => {
       }
 
       // Reload config without changing channel name
-      const wsClient = state.mySocket as unknown as Client;
+      const wsClient = state.mySocket;
       wsClient.send(
         Buffer.from(
           JSON.stringify({
@@ -2160,12 +2211,9 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://0.0.0.0:57102?assignSeqNo=true',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
+      const [endpoint, port] = await createEndpointWithRandomPort(medplum, {
+        ...BASE_ENDPOINT,
+        address: 'mllp://0.0.0.0:57001?assignSeqNo=true',
       });
 
       const agent = await medplum.createResource<Agent>({
@@ -2191,7 +2239,7 @@ describe('HL7', () => {
 
       const client = new Hl7Client({
         host: 'localhost',
-        port: 57102,
+        port,
       });
 
       // Send 3 messages before reload
@@ -2230,7 +2278,7 @@ describe('HL7', () => {
       });
 
       // Reload config with new channel name
-      const wsClient = state.mySocket as unknown as Client;
+      const wsClient = state.mySocket;
       wsClient.send(
         Buffer.from(
           JSON.stringify({
@@ -2330,13 +2378,7 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://localhost:57090',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
-      });
+      const [endpoint, port] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
 
       const agent = await medplum.createResource<Agent>({
         resourceType: 'Agent',
@@ -2368,7 +2410,7 @@ describe('HL7', () => {
 
       const client = new Hl7Client({
         host: 'localhost',
-        port: 57090,
+        port,
       });
 
       // Disable ACKs temporarily so we can check pending state
@@ -2469,7 +2511,7 @@ describe('HL7', () => {
       await app.stop();
     });
 
-    test('When logStatsFreqSecs is not set, channel should not track stats', async () => {
+    test('Channel should track stats by default, even when logStatsFreqSecs is not set', async () => {
       mockServer.on('connection', (socket) => {
         socket.on('message', (data) => {
           const command = JSON.parse((data as Buffer).toString('utf8'));
@@ -2513,13 +2555,7 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://localhost:57091',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
-      });
+      const [endpoint] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
 
       const agent = await medplum.createResource<Agent>({
         resourceType: 'Agent',
@@ -2541,13 +2577,13 @@ describe('HL7', () => {
       const channel = app.channels.get('test');
       expect(channel).toBeDefined();
 
-      // Channel should NOT have stats tracker
-      expect((channel as AgentHl7Channel).stats).toBeUndefined();
+      // Channel should have stats tracker by default
+      expect((channel as AgentHl7Channel).stats).toBeDefined();
 
       await app.stop();
     });
 
-    test('When logStatsFreqSecs is set via reload, channel should start tracking', async () => {
+    test('When logStatsFreqSecs is set via reload, channel still has stats tracker', async () => {
       const state = {
         mySocket: undefined as Client | undefined,
         reloadConfigResponse: null as AgentReloadConfigRequest | null,
@@ -2573,13 +2609,7 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint2 = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://localhost:57092',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
-      });
+      const [endpoint2] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
 
       const agent = await medplum.createResource<Agent>({
         resourceType: 'Agent',
@@ -2606,8 +2636,8 @@ describe('HL7', () => {
       let channel = app.channels.get('test');
       expect(channel).toBeDefined();
 
-      // Channel should NOT have stats tracker initially
-      expect((channel as AgentHl7Channel).stats).toBeUndefined();
+      // Channel should have stats tracker by default
+      expect((channel as AgentHl7Channel).stats).toBeDefined();
 
       // Update agent to enable logStatsFreqSecs
       await medplum.updateResource<Agent>({
@@ -2616,7 +2646,7 @@ describe('HL7', () => {
       });
 
       // Send reload config request
-      const wsClient = state.mySocket as unknown as Client;
+      const wsClient = state.mySocket;
       wsClient.send(
         Buffer.from(
           JSON.stringify({
@@ -2640,7 +2670,7 @@ describe('HL7', () => {
       await app.stop();
     });
 
-    test('When logStatsFreqSecs is removed via reload, channel should stop tracking', async () => {
+    test('When logStatsFreqSecs is removed via reload, channel should keep tracking stats', async () => {
       const state = {
         mySocket: undefined as Client | undefined,
         reloadConfigResponse: null as AgentReloadConfigRequest | null,
@@ -2666,13 +2696,7 @@ describe('HL7', () => {
         });
       });
 
-      const endpoint3 = await medplum.createResource<Endpoint>({
-        resourceType: 'Endpoint',
-        status: 'active',
-        address: 'mllp://localhost:57093',
-        connectionType: { code: ContentType.HL7_V2 },
-        payloadType: [{ coding: [{ code: ContentType.HL7_V2 }] }],
-      });
+      const [endpoint3] = await createEndpointWithRandomPort(medplum, BASE_ENDPOINT);
 
       const agent = await medplum.createResource<Agent>({
         resourceType: 'Agent',
@@ -2710,7 +2734,7 @@ describe('HL7', () => {
       });
 
       // Send reload config request
-      const wsClient = state.mySocket as unknown as Client;
+      const wsClient = state.mySocket;
       wsClient.send(
         Buffer.from(
           JSON.stringify({
@@ -2728,8 +2752,8 @@ describe('HL7', () => {
       channel = app.channels.get('test');
       expect(channel).toBeDefined();
 
-      // Channel should NO LONGER have stats tracker
-      expect((channel as AgentHl7Channel).stats).toBeUndefined();
+      // Channel should still have stats tracker (stats are collected by default)
+      expect((channel as AgentHl7Channel).stats).toBeDefined();
 
       await app.stop();
     });
@@ -2747,11 +2771,11 @@ describe('AgentHl7Channel application-level ACK gating', () => {
       log: createMockLogger(),
       channelLog: createMockLogger(),
       heartbeatEmitter: {
-        addEventListener: jest.fn(),
-        removeEventListener: jest.fn(),
-        dispatchEvent: jest.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
       },
-      getAgentConfig: jest.fn(),
+      getAgentConfig: vi.fn(),
     } as unknown as App;
 
     const definition = { name: 'test-channel' } as AgentChannel;
@@ -2766,12 +2790,12 @@ describe('AgentHl7Channel application-level ACK gating', () => {
     return channel;
   }
 
-  function attachMockConnection(channel: AgentHl7Channel): jest.Mock {
-    const sendMock = jest.fn();
+  function attachMockConnection(channel: AgentHl7Channel): Mock<() => void> {
+    const sendMock = vi.fn();
     const hl7Connection = {
-      setEncoding: jest.fn(),
-      setEnhancedMode: jest.fn(),
-      setMessagesPerMin: jest.fn(),
+      setEncoding: vi.fn(),
+      setEnhancedMode: vi.fn(),
+      setMessagesPerMin: vi.fn(),
       send: sendMock,
     };
     const connection = {
@@ -3011,21 +3035,21 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
         remoteAddress: '127.0.0.1',
         remotePort: 12345,
       },
-      addEventListener: jest.fn((event: string, listener: (...args: any[]) => void) => {
+      addEventListener: vi.fn((event: string, listener: (...args: any[]) => void) => {
         const listeners = eventListeners.get(event) ?? [];
         listeners.push(listener);
         eventListeners.set(event, listeners);
       }),
-      dispatchEvent: jest.fn((event: Event) => {
+      dispatchEvent: vi.fn((event: Event) => {
         for (const listener of eventListeners.get(event.type) ?? EMPTY) {
           listener(event);
         }
       }),
-      setEncoding: jest.fn(),
-      setEnhancedMode: jest.fn(),
-      setMessagesPerMin: jest.fn(),
-      send: jest.fn(),
-      close: jest.fn(),
+      setEncoding: vi.fn(),
+      setEnhancedMode: vi.fn(),
+      setMessagesPerMin: vi.fn(),
+      send: vi.fn(),
+      close: vi.fn(),
     } as unknown as Hl7Connection;
   }
 
@@ -3038,12 +3062,12 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
       log: createMockLogger(),
       channelLog,
       heartbeatEmitter: {
-        addEventListener: jest.fn(),
-        removeEventListener: jest.fn(),
-        dispatchEvent: jest.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
       },
-      getAgentConfig: jest.fn(),
-      addToWebSocketQueue: jest.fn(),
+      getAgentConfig: vi.fn(),
+      addToWebSocketQueue: vi.fn(),
       agentId: 'test-agent',
     } as unknown as App;
 

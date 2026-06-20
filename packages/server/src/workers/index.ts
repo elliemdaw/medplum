@@ -5,16 +5,20 @@ import type { Resource } from '@medplum/fhirtypes';
 import type { MedplumServerConfig, WorkerName } from '../config/types';
 import { getLogger, globalLogger } from '../logger';
 import { initBatchWorker } from './batch';
-import { addCronJobs, initCronWorker } from './cron';
-import { addDownloadJobs, initDownloadWorker } from './download';
+import { initCronWorker } from './cron';
+import { initDataWarehouseSyncWorker } from './data-warehouse-sync';
+import { addDispatchJobs, initDispatchWorker } from './dispatch';
+import { initDownloadWorker } from './download';
+import { initLambdaCleanerWorker } from './lambda-cleaner';
 import { initPostDeployMigrationWorker } from './post-deploy-migration';
 import { initReindexWorker } from './reindex';
 import { initSetAccountsWorker } from './set-accounts';
-import { addSubscriptionJobs, initSubscriptionWorker } from './subscription';
+import { initSubscriptionWorker } from './subscription';
 import type { WorkerInitializer } from './utils';
 import { queueRegistry } from './utils';
 
 const workerDefs: { name: WorkerName; init: WorkerInitializer }[] = [
+  { name: 'dispatch', init: initDispatchWorker },
   { name: 'subscription', init: initSubscriptionWorker },
   { name: 'download', init: initDownloadWorker },
   { name: 'cron', init: initCronWorker },
@@ -22,6 +26,8 @@ const workerDefs: { name: WorkerName; init: WorkerInitializer }[] = [
   { name: 'batch', init: initBatchWorker },
   { name: 'post-deploy-migration', init: initPostDeployMigrationWorker },
   { name: 'set-accounts', init: initSetAccountsWorker },
+  { name: 'lambda-cleaner', init: initLambdaCleanerWorker },
+  { name: 'data-warehouse-sync', init: initDataWarehouseSyncWorker },
 ];
 
 /**
@@ -36,7 +42,10 @@ export function initWorkers(config: MedplumServerConfig): void {
   for (const { name, init } of workerDefs) {
     const workerEnabled = enableAll || enabledWorkers === undefined || enabledWorkers.includes(name);
     const { name: queueName, queue, worker } = init(config, { workerEnabled });
-    queueRegistry.add(queueName, queue, worker);
+    // a queue can be disabled, in which case, don't register it
+    if (queue) {
+      queueRegistry.add(queueName, queue, worker);
+    }
   }
   globalLogger.debug('Workers initialized');
 }
@@ -60,29 +69,9 @@ export async function addBackgroundJobs(
   context: BackgroundJobContext
 ): Promise<void> {
   try {
-    await addSubscriptionJobs(resource, previousVersion, context);
+    await addDispatchJobs(resource, previousVersion, context);
   } catch (err) {
-    getLogger().error('Error adding subscription jobs', {
-      resourceType: resource.resourceType,
-      resource: resource.id,
-      err,
-    });
-  }
-
-  try {
-    await addDownloadJobs(resource, previousVersion, context);
-  } catch (err) {
-    getLogger().error('Error adding download jobs', {
-      resourceType: resource.resourceType,
-      resource: resource.id,
-      err,
-    });
-  }
-
-  try {
-    await addCronJobs(resource, previousVersion, context);
-  } catch (err) {
-    getLogger().error('Error adding cron jobs', {
+    getLogger().error('Error adding dispatch jobs', {
       resourceType: resource.resourceType,
       resource: resource.id,
       err,

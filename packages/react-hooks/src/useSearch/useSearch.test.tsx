@@ -21,7 +21,7 @@ function TestComponent(): JSX.Element {
 
 describe('useSearch hooks', () => {
   beforeAll(() => {
-    console.error = jest.fn();
+    console.error = vi.fn();
   });
 
   async function setup(children: ReactNode): Promise<void> {
@@ -49,7 +49,7 @@ describe('useSearch hooks', () => {
 
   test('Debounced search', async () => {
     const medplum = new MockClient();
-    const medplumSearch = jest.spyOn(medplum, 'search');
+    const medplumSearch = vi.spyOn(medplum, 'search');
 
     const { result, rerender } = renderHook(
       (props) => useSearch('Patient', { name: props.name }, { debounceMs: 150 }),
@@ -87,6 +87,48 @@ describe('useSearch hooks', () => {
     expect(result.current[2]).toEqual(allOk);
   });
 
+  test('enabled: false prevents fetch', async () => {
+    const medplum = new MockClient();
+    const medplumSearch = vi.spyOn(medplum, 'search');
+
+    const { result } = renderHook(() => useSearch('Patient', { name: 'homer' }, { enabled: false }), {
+      wrapper: ({ children }) => <MedplumProvider medplum={medplum}>{children}</MedplumProvider>,
+    });
+
+    await sleep(50);
+    expect(medplumSearch).not.toHaveBeenCalled();
+    expect(result.current[0]).toBeUndefined();
+    expect(result.current[1]).toBe(false); // We are not considered "loading" while not enabled
+    expect(result.current[2]).toBeUndefined();
+  });
+
+  test('enabled changing from false to true triggers fetch', async () => {
+    const medplum = new MockClient();
+    const medplumSearch = vi.spyOn(medplum, 'search');
+
+    const { result, rerender } = renderHook(
+      (props) => useSearch('Patient', { name: 'homer' }, { enabled: props.enabled }),
+      {
+        initialProps: { enabled: false },
+        wrapper: ({ children }) => <MedplumProvider medplum={medplum}>{children}</MedplumProvider>,
+      }
+    );
+
+    await sleep(50);
+    expect(medplumSearch).not.toHaveBeenCalled();
+
+    rerender({ enabled: true });
+
+    // Check until useSearch is no longer loading
+    while (result.current[1]) {
+      await sleep(0);
+    }
+
+    expect(medplumSearch).toHaveBeenCalledTimes(1);
+    expect(result.current[0]?.resourceType).toBe('Bundle');
+    expect(result.current[1]).toBe(false);
+  });
+
   test('Slow queries returning out of order', async () => {
     const medplum = new MockClient();
 
@@ -101,8 +143,7 @@ describe('useSearch hooks', () => {
       resolveSecond = resolve;
     });
 
-    jest
-      .spyOn(medplum, 'search')
+    vi.spyOn(medplum, 'search')
       .mockReturnValueOnce(firstPromise as ReturnType<typeof medplum.search>)
       .mockReturnValueOnce(secondPromise as ReturnType<typeof medplum.search>);
 

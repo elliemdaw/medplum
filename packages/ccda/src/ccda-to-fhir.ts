@@ -316,11 +316,11 @@ class CcdaToFhirConverter {
     }
     return addresses?.map((addr) => ({
       use: addr['@_use'] ? ADDRESS_USE_MAPPER.mapCcdaToFhir(addr['@_use']) : undefined,
-      line: addr.streetAddressLine,
-      city: addr.city,
-      state: addr.state,
-      postalCode: addr.postalCode,
-      country: addr.country,
+      line: addr.streetAddressLine?.map(nodeToString).filter(Boolean) as string[] | undefined,
+      city: nodeToString(addr.city),
+      state: nodeToString(addr.state),
+      postalCode: nodeToString(addr.postalCode),
+      country: nodeToString(addr.country),
     }));
   }
 
@@ -743,17 +743,29 @@ class CcdaToFhirConverter {
   }
 
   private processReaction(reactionObs: CcdaObservation): AllergyIntoleranceReaction {
+    const manifestation = this.mapCode(reactionObs.value as CcdaCode) ?? {
+      extension: [
+        {
+          url: 'http://hl7.org/fhir/StructureDefinition/data-absent-reason',
+          valueCode: 'unknown',
+        },
+      ],
+    };
+
     const reaction: AllergyIntoleranceReaction = {
       id: this.mapId(reactionObs.id),
-      manifestation: [this.mapCode(reactionObs.value as CcdaCode)] as CodeableConcept[],
+      manifestation: [manifestation],
       onset: mapCcdaToFhirDateTime(reactionObs.effectiveTime?.[0]?.low?.['@_value']),
     };
 
     this.processSeverity(reactionObs, reaction);
 
     // Add reaction reference
-    if (reaction.manifestation && reaction.manifestation.length > 0 && reactionObs.text?.reference?.['@_value']) {
-      reaction.manifestation[0].extension = this.mapTextReference(reactionObs.text);
+    if (reactionObs.text?.reference?.['@_value']) {
+      const textRefExtension = this.mapTextReference(reactionObs.text);
+      if (textRefExtension) {
+        reaction.manifestation[0].extension = [...(reaction.manifestation[0].extension ?? []), ...textRefExtension];
+      }
     }
 
     return reaction;
@@ -844,7 +856,13 @@ class CcdaToFhirConverter {
       });
     }
 
-    for (const translation of code.translation ?? EMPTY) {
+    let translations: CcdaCode[] = [];
+    if (Array.isArray(code.translation)) {
+      translations = code.translation;
+    } else if (code.translation) {
+      translations = [code.translation];
+    }
+    for (const translation of translations) {
       const translationSystem = mapCcdaSystemToFhir(translation['@_codeSystem']);
       const translationCode = translation['@_code'];
       const translationDisplay = translation['@_displayName'];
@@ -1157,8 +1175,8 @@ class CcdaToFhirConverter {
 
     for (const entryRelationship of observation.entryRelationship ?? EMPTY) {
       target.push({
-        measure: this.mapCode(entryRelationship.act?.[0]?.code) as CodeableConcept,
-        detailCodeableConcept: this.mapCode(entryRelationship.act?.[0]?.code) as CodeableConcept,
+        measure: this.mapCode(entryRelationship.act?.[0]?.code),
+        detailCodeableConcept: this.mapCode(entryRelationship.act?.[0]?.code),
         dueDate: mapCcdaToFhirDateTime(entryRelationship.act?.[0]?.effectiveTime?.[0]?.low?.['@_value']),
       });
     }

@@ -10,7 +10,8 @@ import { loadAzureConfig } from '../cloud/azure/config';
 import { loadGcpConfig } from '../cloud/gcp/config';
 import type { MedplumServerConfig } from './types';
 import type { ServerConfig } from './utils';
-import { addDefaults, isBooleanConfig, isFloatConfig, isIntegerConfig, isObjectConfig } from './utils';
+import { addDefaults, isArrayConfig, isBooleanConfig, isFloatConfig, isIntegerConfig, isObjectConfig } from './utils';
+import { warnInvalidDataWarehouseConfig } from './validate-config';
 
 let cachedConfig: ServerConfig | undefined = undefined;
 
@@ -63,7 +64,9 @@ export async function loadConfig(configName: string): Promise<MedplumServerConfi
     throw new Error('Missing required config setting: baseUrl. Please set "baseUrl" in your configuration.');
   }
 
-  cachedConfig = addDefaults(config);
+  const withDefaults = addDefaults(config);
+  warnInvalidDataWarehouseConfig(withDefaults);
+  cachedConfig = withDefaults;
   return cachedConfig;
 }
 
@@ -156,6 +159,8 @@ export async function loadTestConfig(): Promise<MedplumServerConfig> {
   config.defaultRateLimit = -1; // Disable rate limiter by default in tests
   config.defaultSuperAdminClientId = randomUUID();
   config.defaultSuperAdminClientSecret = randomUUID();
+  config.mtlsCertHeader = 'x-mtls-cert';
+  warnInvalidDataWarehouseConfig(config);
   return config;
 }
 
@@ -181,6 +186,20 @@ function loadEnvConfig(): MedplumServerConfig {
       key = key.substring('DATABASE_'.length);
       currConfig = config.database ??= {};
       section = 'database';
+      if (key.startsWith('SSL_')) {
+        key = key.substring('SSL_'.length);
+        currConfig = config.database.ssl = config.database.ssl ?? {};
+        section = 'database.ssl';
+      }
+    } else if (key.startsWith('READONLY_DATABASE_')) {
+      key = key.substring('READONLY_DATABASE_'.length);
+      currConfig = config.readonlyDatabase ??= {};
+      section = 'readonlyDatabase';
+      if (key.startsWith('SSL_')) {
+        key = key.substring('SSL_'.length);
+        currConfig = config.readonlyDatabase.ssl = config.readonlyDatabase.ssl ?? {};
+        section = 'readonlyDatabase.ssl';
+      }
     } else if (key.startsWith('CACHE_REDIS_')) {
       key = key.substring('CACHE_REDIS_'.length);
       currConfig = config.cacheRedis ??= {};
@@ -217,6 +236,10 @@ function loadEnvConfig(): MedplumServerConfig {
       key = key.substring('WORKERS_'.length);
       currConfig = config.workers ??= {};
       section = 'workers';
+    } else if (key.startsWith('DATA_WAREHOUSE_')) {
+      key = key.substring('DATA_WAREHOUSE_'.length);
+      currConfig = config.dataWarehouse ??= {};
+      section = 'dataWarehouse';
     }
 
     // Convert key from CAPITAL_CASE to camelCase
@@ -234,6 +257,8 @@ function loadEnvConfig(): MedplumServerConfig {
       currConfig[key] = value === 'true';
     } else if (isObjectConfig(lookupKey) || isObjectConfig(key)) {
       currConfig[key] = JSON.parse(value ?? '');
+    } else if (isArrayConfig(lookupKey) || isArrayConfig(key)) {
+      currConfig[key] = value?.split(',').map((v) => v.trim());
     } else {
       currConfig[key] = value;
     }

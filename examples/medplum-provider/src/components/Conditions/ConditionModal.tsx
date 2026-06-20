@@ -57,11 +57,12 @@ export default function ConditionModal(props: ConditionDialogProps): JSX.Element
     <Form onSubmit={handleSubmit}>
       <Stack>
         <CodeableConceptInput
-          binding="http://hl7.org/fhir/sid/icd-10-cm/vs"
+          binding="http://hl7.org/fhir/sid/icd-10-cm/vs/billable"
           label="ICD-10 Code"
           name="diagnosis"
           path="Condition.code"
           required
+          maxValues={1}
           onChange={(diagnosis) => setDiagnosis(diagnosis)}
         />
 
@@ -69,6 +70,7 @@ export default function ConditionModal(props: ConditionDialogProps): JSX.Element
           name="clinicalStatus"
           label="Status"
           path="Condition.clinicalStatus"
+          maxValues={1}
           binding={HTTP_HL7_ORG + '/fhir/ValueSet/condition-clinical'}
           onChange={(clinicalStatus) => setClinicalStatus(clinicalStatus)}
           required

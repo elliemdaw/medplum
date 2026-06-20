@@ -33,7 +33,7 @@ describe('Reference checks', () => {
         email: randomUUID() + '@example.com',
         password: randomUUID(),
       });
-      const systemRepo = getProjectSystemRepo(project);
+      const systemRepo = await getProjectSystemRepo(project);
       const updatedProject = await systemRepo.updateResource({
         ...project,
         checkReferencesOnWrite: true,
@@ -201,7 +201,7 @@ describe('Reference checks', () => {
         password: randomUUID(),
       });
 
-      const systemRepo = getProjectSystemRepo(project);
+      const systemRepo = await getProjectSystemRepo(project);
       project = await systemRepo.updateResource({ ...project, checkReferencesOnWrite: true });
 
       const repo = await getRepoForLogin({
@@ -236,7 +236,7 @@ describe('Reference checks', () => {
         ],
       };
 
-      await expect(repo.createResource<Patient>(patient)).resolves.toBeDefined();
+      await expect(repo.createResource(patient)).resolves.toBeDefined();
     }));
 
   test('Check references with reference placeholder', () =>
@@ -285,8 +285,8 @@ describe('Reference checks', () => {
         ],
       };
 
-      await expect(repo.createResource<Patient>(patient)).resolves.toBeDefined();
-      await expect(repo.createResource<Questionnaire>(questionnaire)).resolves.toBeDefined();
+      await expect(repo.createResource(patient)).resolves.toBeDefined();
+      await expect(repo.createResource(questionnaire)).resolves.toBeDefined();
     }));
 
   test('Resources with identical references', () => {

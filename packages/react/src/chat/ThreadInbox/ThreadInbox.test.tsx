@@ -6,12 +6,12 @@ import { HomerSimpson, MockClient } from '@medplum/mock';
 import * as reactHooks from '@medplum/react-hooks';
 import { MedplumProvider } from '@medplum/react-hooks';
 import { MemoryRouter } from 'react-router';
-import { render, screen, userEvent, waitFor } from '../../test-utils/render';
+import { act, render, screen, userEvent, waitFor } from '../../test-utils/render';
 import { ThreadInbox } from './ThreadInbox';
 
-jest.mock('@medplum/react-hooks', () => ({
-  ...jest.requireActual('@medplum/react-hooks'),
-  useSubscription: jest.fn(),
+vi.mock(import('@medplum/react-hooks'), async (importOriginal) => ({
+  ...(await importOriginal()),
+  useSubscription: vi.fn(),
 }));
 
 const mockCommunication: Communication | undefined = {
@@ -22,51 +22,63 @@ const mockCommunication: Communication | undefined = {
   subject: { reference: `Patient/${HomerSimpson.id}` },
 };
 
-const mockOnNew = jest.fn();
-const mockGetThreadUri = jest.fn((topic: Communication) => `/Message/${topic.id}`);
-const mockOnChange = jest.fn();
+const mockOnNew = vi.fn();
+const mockGetThreadUri = vi.fn((topic: Communication) => `/Message/${topic.id}`);
+const mockOnChange = vi.fn();
+const mockNavigate = vi.fn();
 
 describe('ThreadInbox', () => {
   let medplum: MockClient;
 
   beforeEach(async () => {
     medplum = new MockClient();
-    jest.clearAllMocks();
-    jest.mocked(reactHooks.useSubscription).mockClear();
+    vi.clearAllMocks();
+    vi.mocked(reactHooks.useSubscription).mockClear();
+    mockNavigate.mockClear();
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       total: 0,
       entry: [],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({
+    medplum.graphql = vi.fn().mockResolvedValue({
       data: { CommunicationList: [] },
     });
   });
 
-  const setup = (props?: { threadId?: string; showPatientSummary?: boolean; subject?: typeof HomerSimpson }): void => {
-    render(
-      <>
-        <Notifications />
-        <ThreadInbox
-          query="_sort=-_lastUpdated"
-          threadId={props?.threadId}
-          showPatientSummary={props?.showPatientSummary ?? false}
-          subject={props?.subject}
-          onNew={mockOnNew}
-          getThreadUri={mockGetThreadUri}
-          onChange={mockOnChange}
-          inProgressUri="/Communication?status=in-progress"
-          completedUri="/Communication?status=completed"
-        />
-      </>,
-      ({ children }) => (
-        <MemoryRouter>
-          <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
-        </MemoryRouter>
-      )
-    );
+  const setup = async (props?: {
+    threadId?: string;
+    showPatientSummary?: boolean;
+    subject?: typeof HomerSimpson;
+  }): Promise<void> => {
+    await act(async () => {
+      render(
+        <>
+          <Notifications />
+          <ThreadInbox
+            query="_sort=-_lastUpdated"
+            threadId={props?.threadId}
+            showPatientSummary={props?.showPatientSummary ?? false}
+            subject={props?.subject}
+            onNew={mockOnNew}
+            getThreadUri={mockGetThreadUri}
+            onChange={mockOnChange}
+            inProgressUri="/Communication?status=in-progress"
+            completedUri="/Communication?status=completed"
+          />
+        </>,
+        ({ children }) => (
+          <MemoryRouter>
+            <MedplumProvider medplum={medplum} navigate={mockNavigate}>
+              {children}
+            </MedplumProvider>
+          </MemoryRouter>
+        )
+      );
+
+      await Promise.resolve();
+    });
   };
 
   test('renders filter buttons and new message button', async () => {
@@ -84,8 +96,8 @@ describe('ThreadInbox', () => {
   });
 
   test('shows loading skeletons when loading', async () => {
-    medplum.search = jest.fn().mockImplementation(() => new Promise(() => {}));
-    setup();
+    medplum.search = vi.fn().mockImplementation(() => new Promise(() => {}));
+    await setup();
 
     await waitFor(() => {
       const skeletons = document.querySelectorAll('.mantine-Skeleton-root');
@@ -140,14 +152,14 @@ describe('ThreadInbox', () => {
       await medplum.createResource(msg);
     }
 
-    jest.spyOn(medplum, 'search').mockResolvedValue({
+    vi.spyOn(medplum, 'search').mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       total: 2,
       entry: [{ resource: communications[0] }, { resource: communications[1] }],
     } as any);
 
-    jest.spyOn(medplum, 'graphql').mockImplementation(() =>
+    vi.spyOn(medplum, 'graphql').mockImplementation(() =>
       Promise.resolve({
         data: {
           thread_comm1: [lastMessages[0]],
@@ -156,7 +168,7 @@ describe('ThreadInbox', () => {
       })
     );
 
-    setup();
+    await setup();
 
     await waitFor(
       () => {
@@ -168,14 +180,14 @@ describe('ThreadInbox', () => {
   });
 
   test('shows no messages state when no thread is selected', async () => {
-    setup();
+    await setup();
     await waitFor(() => {
       expect(screen.getByText('Select a message from the list to view details')).toBeInTheDocument();
     });
   });
 
   test('shows empty messages state when no messages are found', async () => {
-    setup();
+    await setup();
     await waitFor(
       () => {
         expect(screen.getByText('No messages found')).toBeInTheDocument();
@@ -187,14 +199,14 @@ describe('ThreadInbox', () => {
   test('shows thread chat when thread is selected', async () => {
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -204,23 +216,23 @@ describe('ThreadInbox', () => {
       { timeout: 3000 }
     );
 
-    expect(jest.mocked(reactHooks.useSubscription)).toHaveBeenCalled();
+    expect(vi.mocked(reactHooks.useSubscription)).toHaveBeenCalled();
   });
 
   test('shows patient summary when showPatientSummary is true and thread is selected', async () => {
     const medplumReact = await import('../../PatientSummary/PatientSummary');
-    const patientSummarySpy = jest.spyOn(medplumReact, 'PatientSummary');
+    const patientSummarySpy = vi.spyOn(medplumReact, 'PatientSummary');
 
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ showPatientSummary: true, threadId: 'comm-123' });
+    await setup({ showPatientSummary: true, threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -232,18 +244,18 @@ describe('ThreadInbox', () => {
 
   test('does not show patient summary when showPatientSummary is false', async () => {
     const medplumReact = await import('../../PatientSummary/PatientSummary');
-    const patientSummarySpy = jest.spyOn(medplumReact, 'PatientSummary');
+    const patientSummarySpy = vi.spyOn(medplumReact, 'PatientSummary');
 
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ showPatientSummary: false, threadId: 'comm-123' });
+    await setup({ showPatientSummary: false, threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -255,7 +267,7 @@ describe('ThreadInbox', () => {
 
   test('opens new topic dialog when plus button is clicked', async () => {
     const user = userEvent.setup();
-    setup();
+    await setup();
 
     const iconButtons = screen.getAllByRole('button', { name: '' });
     const plusButton = iconButtons[iconButtons.length - 1];
@@ -268,7 +280,7 @@ describe('ThreadInbox', () => {
 
   test('closes new topic dialog when close is clicked', async () => {
     const user = userEvent.setup();
-    setup();
+    await setup();
 
     const iconButtons = screen.getAllByRole('button', { name: '' });
     const plusButton = iconButtons[iconButtons.length - 1];
@@ -292,14 +304,14 @@ describe('ThreadInbox', () => {
     const commWithoutTopic: Communication = { ...mockCommunication, topic: undefined };
     await medplum.createResource(commWithoutTopic);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: commWithoutTopic }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -312,7 +324,7 @@ describe('ThreadInbox', () => {
 
   test('changes status filter to completed when Completed button is clicked', async () => {
     const user = userEvent.setup();
-    setup();
+    await setup();
 
     const completedButton = screen.getByText('Completed');
     await user.click(completedButton);
@@ -326,14 +338,14 @@ describe('ThreadInbox', () => {
     const user = userEvent.setup();
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -355,16 +367,16 @@ describe('ThreadInbox', () => {
     const user = userEvent.setup();
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    const updateResourceSpy = jest.spyOn(medplum, 'updateResource');
+    const updateResourceSpy = vi.spyOn(medplum, 'updateResource');
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -394,14 +406,14 @@ describe('ThreadInbox', () => {
     const completedCommunication: Communication = { ...mockCommunication, status: 'completed' };
     await medplum.createResource(completedCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: completedCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -417,14 +429,14 @@ describe('ThreadInbox', () => {
     const stoppedCommunication: Communication = { ...mockCommunication, status: 'stopped' };
     await medplum.createResource(stoppedCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: stoppedCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -440,15 +452,15 @@ describe('ThreadInbox', () => {
     const user = userEvent.setup();
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
-    medplum.updateResource = jest.fn().mockRejectedValue(new Error('Status update failed'));
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.updateResource = vi.fn().mockRejectedValue(new Error('Status update failed'));
 
-    setup({ threadId: 'comm-123' });
+    await setup({ threadId: 'comm-123' });
 
     await waitFor(
       () => {
@@ -477,15 +489,15 @@ describe('ThreadInbox', () => {
   test('shows pagination when total exceeds items per page', async () => {
     await medplum.createResource(mockCommunication);
 
-    medplum.search = jest.fn().mockResolvedValue({
+    medplum.search = vi.fn().mockResolvedValue({
       resourceType: 'Bundle',
       type: 'searchset',
       total: 50,
       entry: [{ resource: mockCommunication }],
     });
-    medplum.graphql = jest.fn().mockResolvedValue({ data: { CommunicationList: [] } });
+    medplum.graphql = vi.fn().mockResolvedValue({ data: { CommunicationList: [] } });
 
-    setup();
+    await setup();
 
     await waitFor(
       () => {

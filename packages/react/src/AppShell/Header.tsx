@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Group, AppShell as MantineAppShell, Menu, Text, UnstyledButton } from '@mantine/core';
 import { formatHumanName } from '@medplum/core';
-import type { HumanName } from '@medplum/fhirtypes';
 import { useMedplumProfile } from '@medplum/react-hooks';
 import { IconChevronDown } from '@tabler/icons-react';
 import type { JSX, ReactNode } from 'react';
@@ -10,6 +9,7 @@ import { useState } from 'react';
 import { ResourceAvatar } from '../ResourceAvatar/ResourceAvatar';
 import classes from './Header.module.css';
 import { HeaderDropdown } from './HeaderDropdown';
+import headerDropdownClasses from './HeaderDropdown.module.css';
 import { HeaderSearchInput } from './HeaderSearchInput';
 
 export interface HeaderProps {
@@ -47,7 +47,8 @@ export function Header(props: HeaderProps): JSX.Element {
           {props.notifications}
           <Menu
             width={260}
-            shadow="xl"
+            shadow="md"
+            radius="md"
             position="bottom-end"
             transitionProps={{ transition: 'fade-down' }}
             opened={userMenuOpened}
@@ -63,13 +64,13 @@ export function Header(props: HeaderProps): JSX.Element {
                 <Group gap={7}>
                   <ResourceAvatar value={profile} radius="xl" size={24} />
                   <Text size="sm" className={classes.userName}>
-                    {formatHumanName(profile?.name?.[0] as HumanName)}
+                    {formatHumanName(profile?.name?.[0])}
                   </Text>
                   <IconChevronDown size={12} stroke={1.5} />
                 </Group>
               </UnstyledButton>
             </Menu.Target>
-            <Menu.Dropdown>
+            <Menu.Dropdown className={headerDropdownClasses.dropdown}>
               <HeaderDropdown version={props.version} />
             </Menu.Dropdown>
           </Menu>

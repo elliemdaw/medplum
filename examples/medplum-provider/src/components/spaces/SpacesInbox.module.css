@@ -135,8 +135,27 @@
   border-bottom-left-radius: 4px;
 }
 
+/* Scroll to bottom button */
+.scrollToBottomWrapper {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: center;
+  z-index: 20;
+  pointer-events: none;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.scrollToBottomButton {
+  pointer-events: auto;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
 /* Input Area */
 .inputArea {
+  position: relative;
   padding: var(--mantine-spacing-xl);
   background: linear-gradient(to top, var(--mantine-color-body) 80%, rgba(255, 255, 255, 0));
   display: flex;
@@ -179,6 +198,31 @@
   justify-content: space-between;
   align-items: center;
   background-color: var(--mantine-color-gray-0);
+}
+
+/* Tool calls */
+.toolCallGroup {
+  min-width: 0;
+}
+
+.toolCallBadge {
+  flex-shrink: 0;
+}
+
+.toolCallPath {
+  min-width: 0;
+  white-space: normal;
+  word-break: break-all;
+}
+
+/* Tool response */
+.toolResponseCode {
+  max-height: 300px;
+  overflow: auto;
+  margin-top: 6px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* Utilities */
